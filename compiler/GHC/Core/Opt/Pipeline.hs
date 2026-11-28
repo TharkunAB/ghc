@@ -6,7 +6,18 @@
 
 {-# LANGUAGE CPP #-}
 
-module GHC.Core.Opt.Pipeline ( core2core, simplifyExpr ) where
+module GHC.Core.Opt.Pipeline
+  ( core2core
+  , core2coreWithPluginMutations
+  , core2coreRetained
+  , core2coreRetainedWithPluginMutations
+  , runRetainedCorePluginPasses
+  , runRetainedCorePluginPassesWithPluginMutations
+  , simplifyExpr
+  , pairObservationOcc
+  , pairObservationType
+  , scalarRecipeTableOcc
+  ) where
 
 import GHC.Prelude
 
@@ -14,23 +25,38 @@ import GHC.Driver.DynFlags
 import GHC.Driver.Plugins ( withPlugins, installCoreToDos )
 import GHC.Driver.Env
 import GHC.Driver.Config (initSimpleOpts)
-import GHC.Driver.Config.Core.Lint ( endPass )
+import GHC.Driver.Config.Core.Lint ( endPass, initEndPassConfig )
 import GHC.Driver.Config.Core.Opt.LiberateCase ( initLiberateCaseOpts )
 import GHC.Driver.Config.Core.Opt.Simplify ( initSimplifyOpts, initSimplMode, initGentleSimplMode )
 import GHC.Driver.Config.Core.Opt.WorkWrap ( initWorkWrapOpts )
 import GHC.Driver.Config.Core.Rules ( initRuleOpts )
 import GHC.Platform.Ways  ( hasWay, Way(WayProf) )
 
+import GHC.Builtin.WiredIn.Types
+  (boolTy, charTy, naturalTy, pairTyCon)
 import GHC.Core
-import GHC.Core.SimpleOpt (simpleOptPgm)
-import GHC.Core.Opt.CSE  ( cseProgram )
+import GHC.Core.TyCo.Rep (scaledThing)
+import GHC.Core.TyCo.Compare (eqType)
+import GHC.Core.Type
+  (Type, mkVisFunTyManyU, splitFunTys, splitTyConApp_maybe)
+import GHC.Types.Basic (LeftOrRight(..))
+import GHC.Types.Name.Occurrence (OccName, mkVarOcc, occNameString)
+import GHC.Types.Var (Var)
+import GHC.Core.Dependent
+import GHC.Core.Lint ( endScopedDictionaryPassIO )
+import GHC.Core.Map.Expr ( eqCoreExpr )
+import GHC.Core.SimpleOpt (simpleOptNativeProgram, simpleOptPgm)
+import GHC.Core.Opt.CSE  ( cseProgramWithMode )
 import GHC.Core.Rules   ( RuleBase, ruleCheckProgram, getRules )
 import GHC.Core.Ppr     ( pprCoreBindings, pprRules )
 import GHC.Core.Utils   ( dumpIdInfoOfProgram, diffBinds, stripTicksE )
 import GHC.Core.Lint.Interactive ( interactiveInScope )
-import GHC.Core.Opt.Simplify ( simplifyExpr, simplifyPgm )
+import GHC.Core.Opt.Simplify ( SimplifyExprOpts, SimplifyOpts(..), simplifyPgm )
+import GHC.Core.Opt.Simplify.Env (SimplMode(..))
+import qualified GHC.Core.Opt.Simplify as Simplify
 import GHC.Core.Opt.Simplify.Monad
 import GHC.Core.Opt.Monad
+import GHC.Core.Opt.OccurAnal (SimplCoreMode(..))
 import GHC.Core.Opt.Pipeline.Types
 import GHC.Core.Opt.FloatIn      ( floatInwards )
 import GHC.Core.Opt.FloatOut     ( floatOutwards )
@@ -54,17 +80,21 @@ import GHC.Utils.Outputable
 import GHC.Utils.Panic
 
 import GHC.Unit.Module.ModGuts
+import GHC.Unit.External ( ExternalUnitCache )
 
+import GHC.Types.Id (idName, idType)
 import GHC.Types.Id.Info
 import GHC.Types.Tickish ( tickishIsCode )
 import GHC.Types.Var.Env ( mkRnEnv2, emptyInScopeSet )
 import GHC.Types.InlinePragma ( CompilerPhase(..) )
 import GHC.Types.Demand ( zapDmdEnvSig )
+import GHC.Types.Name.Env ( mkNameEnv, lookupNameEnv )
 import GHC.Types.Name.Ppr
-import GHC.Types.Var ( Var )
+import GHC.Types.Name.Set ( NameSet, mkNameSet, unionNameSet )
 import GHC.Types.Unique.Supply ( UniqueTag(..) )
 
 import Control.Monad
+import Data.IORef ( IORef, modifyIORef' )
 import GHC.Unit.Module
 
 {-
@@ -75,21 +105,85 @@ import GHC.Unit.Module
 ************************************************************************
 -}
 
+-- | Reject native dependent Core before simplifying a standalone expression.
+simplifyExpr :: Logger -> ExternalUnitCache -> SimplifyExprOpts -> CoreExpr -> IO CoreExpr
+simplifyExpr logger euc opts expr = do
+  rejectNativeDependentExpr "expression simplification" expr
+  Simplify.simplifyExpr logger euc opts expr
+
 core2core :: HscEnv -> ModGuts -> IO ModGuts
-core2core hsc_env guts@(ModGuts { mg_module  = mod
+core2core = core2coreWithPluginMutations Nothing
+
+-- | Run the standard Core optimizer while recording top-level bindings mutated by 'CoreDoPluginPass'.
+core2coreWithPluginMutations :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO ModGuts
+core2coreWithPluginMutations mb_mut_ref = core2coreFor mb_mut_ref OrdinaryCore
+
+-- | Run the standard optimizer for a module that passed the retained gate.
+core2coreRetained :: HscEnv -> ModGuts -> IO ModGuts
+core2coreRetained = core2coreRetainedWithPluginMutations Nothing
+
+-- | Run the retained Core optimizer while recording top-level bindings mutated by 'CoreDoPluginPass'.
+core2coreRetainedWithPluginMutations :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO ModGuts
+core2coreRetainedWithPluginMutations mb_mut_ref = core2coreFor mb_mut_ref RetainedCore
+
+-- | Run Core-to-Core plugin passes installed on an @-O0@ retained module.
+-- See Note [Plugin hooks and Dependent Haskell pipelines] in GHC.Driver.Plugins.
+runRetainedCorePluginPasses :: HscEnv -> ModGuts -> IO ModGuts
+runRetainedCorePluginPasses = runRetainedCorePluginPassesWithPluginMutations Nothing
+
+-- | Run @-O0@ retained Core plugin passes while recording mutated top-level bindings.
+runRetainedCorePluginPassesWithPluginMutations :: Maybe (IORef NameSet) -> HscEnv -> ModGuts -> IO ModGuts
+runRetainedCorePluginPassesWithPluginMutations mb_mut_ref hsc_env guts@(ModGuts { mg_module  = mod
+                                                                                , mg_loc     = loc
+                                                                                , mg_rdr_env = rdr_env })
+  = do { hpt_rule_base <- hugRulesBelow hsc_env (moduleUnitId mod)
+                            (GWIB { gwib_mod = moduleName mod, gwib_isBoot = NotBoot })
+       ; (guts2, _) <- runCoreM hsc_env hpt_rule_base SimplTag mod name_ppr_ctx loc $
+                         do { hsc_env' <- getHscEnv
+                            ; raw_passes <- withPlugins (hsc_plugins hsc_env') installCoreToDos []
+                            ; let passes = foldr adaptRetainedPass [] raw_passes
+                            ; optimized <- runCorePasses mb_mut_ref RetainedCore passes guts
+                            ; pure (optimized { mg_binds = simpleOptNativeProgram (mg_binds optimized) }) }
+       ; return guts2 }
+  where
+    dflags       = hsc_dflags hsc_env
+    unit_env     = hsc_unit_env hsc_env
+    ptc          = initPromotionTickContext dflags
+    name_ppr_ctx = mkNamePprCtx ptc unit_env rdr_env
+
+-- | Adapt a 'CoreToDo' pass to 'RetainedCore' mode.
+adaptRetainedPass :: CoreToDo -> [CoreToDo] -> [CoreToDo]
+adaptRetainedPass CoreDesugarOpt rest = rest
+adaptRetainedPass (CoreDoFloatOutwards opts) rest =
+  CoreDoFloatOutwards (opts { floatCoreMode = RetainedCore }) : rest
+adaptRetainedPass (CoreDoSimplify opts) rest =
+  CoreDoSimplify (opts { so_mode = (so_mode opts) { sm_core_mode = RetainedCore } }) : rest
+adaptRetainedPass (CoreDoPasses ps) rest =
+  CoreDoPasses (foldr adaptRetainedPass [] ps) : rest
+adaptRetainedPass pass rest = pass : rest
+
+core2coreFor :: Maybe (IORef NameSet) -> SimplCoreMode -> HscEnv -> ModGuts -> IO ModGuts
+core2coreFor mb_mut_ref mode hsc_env guts@(ModGuts { mg_module  = mod
                                 , mg_loc     = loc
                                 , mg_rdr_env = rdr_env })
   = do { hpt_rule_base <- home_pkg_rules
-       ; let builtin_passes = getCoreToDo dflags hpt_rule_base extra_vars
+       ; let planned = getCoreToDo dflags hpt_rule_base extra_vars
              uniq_tag = SimplTag
 
        ; (guts2, stats) <- runCoreM hsc_env hpt_rule_base uniq_tag mod
                                     name_ppr_ctx loc $
                            do { hsc_env' <- getHscEnv
-                              ; all_passes <- withPlugins (hsc_plugins hsc_env')
-                                                installCoreToDos
-                                                builtin_passes
-                              ; runCorePasses all_passes guts }
+                              ; raw_passes <- withPlugins (hsc_plugins hsc_env')
+                                                installCoreToDos planned
+                              ; let all_passes = case mode of
+                                      OrdinaryCore -> raw_passes
+                                      RetainedCore -> foldr adaptRetainedPass [] raw_passes
+                              ; optimized <- runCorePasses mb_mut_ref mode all_passes guts
+                              ; let final
+                                      | RetainedCore <- mode
+                                      = optimized { mg_binds = simpleOptNativeProgram (mg_binds optimized) }
+                                      | otherwise = optimized
+                              ; pure final }
 
        ; Logger.putDumpFileMaybe logger Opt_D_dump_simpl_stats
              "Grand total simplifier statistics"
@@ -101,7 +195,8 @@ core2core hsc_env guts@(ModGuts { mg_module  = mod
     dflags         = hsc_dflags hsc_env
     logger         = hsc_logger hsc_env
     unit_env       = hsc_unit_env hsc_env
-    extra_vars     = interactiveInScope (hsc_IC hsc_env)
+    extra_vars | RetainedCore <- mode = []
+               | otherwise = interactiveInScope (hsc_IC hsc_env)
     home_pkg_rules = hugRulesBelow hsc_env (moduleUnitId mod)
                       (GWIB { gwib_mod = moduleName mod, gwib_isBoot = NotBoot })
     name_ppr_ctx   = mkNamePprCtx ptc unit_env rdr_env
@@ -111,6 +206,68 @@ core2core hsc_env guts@(ModGuts { mg_module  = mod
     -- consume the ModGuts to find the module) but somewhat ugly because mg_module may
     -- _theoretically_ be changed during the Core pipeline (it's part of ModGuts), which
     -- would mean our cached value would go out of date.
+
+{- Note [Executable pair field observations]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Choose the ABI from the exported ordinary signature. A replacement body
+must supply the same symbol even when its proof becomes false. The
+pair ABI covers unrestricted arrows from a scalar codec to a pair of
+scalar codecs. Relay entries support unrestricted arrows between the
+same codecs. In the library error module, entries are also available
+for functions with a universally quantified result. Their value arity
+comes from their checked type. These restrictions bound code growth.
+
+Read final Core after the user's RULES and plugins. Use the exact raise#
+primitive as a proof of nonreturn. Serialize an imported call's exact
+owner and value arity as a recipe. An older object can lack its hidden
+entry without losing an ordinary symbol. The type checker resolves
+the recipe in the interpreter, where each link is optional. The object
+never refers to an imported proof closure from native code.
+
+The first-field observer keeps its original name. The second-field
+observer has a distinct name. A first-field-only object can still
+supply the first observer after recompilation of its interface.
+
+Publish one String table when the module can emit a scalar recipe.
+An empty table keeps the same entry after an object-only replacement.
+Only the interpreter looks up the table. Older objects can still provide
+per-owner scalar entries.
+-}
+
+-- | Hidden executable entry with the ordinary owner's stable ABI arity.
+pairObservationOcc :: Maybe LeftOrRight -> Int -> OccName -> OccName
+pairObservationOcc side arity owner =
+    mkVarOcc ("$readback2:" ++ side_tag ++ show arity ++ ":" ++ occNameString owner)
+  where
+    side_tag = case side of
+      Just CRight -> "right:"
+      _ -> ""
+
+-- | Stable module entry for the scalar recipes. An empty table keeps the
+-- publication marker across a later object-only replacement.
+scalarRecipeTableOcc :: OccName
+scalarRecipeTableOcc = mkVarOcc "$readback2:scalar-table"
+
+-- | Recognize an ordinary producer supported by the first observation ABI.
+pairObservationType :: Type -> Maybe (Type, Type)
+pairObservationType ty = do
+    (input, result) <- observationArrow ty
+    (constructor, [left, right]) <- splitTyConApp_maybe result
+    guard (constructor == pairTyCon && scalarCodec left && scalarCodec right)
+    pure (input, result)
+
+-- | One unrestricted argument with an existing scalar readback codec.
+observationArrow :: Type -> Maybe (Type, Type)
+observationArrow ty = do
+    let (_, args, result) = splitFunTys ty
+    [arg] <- pure args
+    let input = scaledThing arg
+    guard (scalarCodec input && ty `eqType` mkVisFunTyManyU input result)
+    pure (input, result)
+
+-- | Scalar codecs for the bounded native ABI.
+scalarCodec :: Type -> Bool
+scalarCodec ty = any (eqType ty) [boolTy, charTy, naturalTy]
 
 {-
 ************************************************************************
@@ -208,7 +365,8 @@ getCoreToDo dflags hpt_rule_base extra_vars
 
         runWhen full_laziness
            (CoreDoFloatOutwards $ FloatOutSwitches
-                { floatOutLambdas     = Just 0
+                { floatCoreMode       = OrdinaryCore
+                , floatOutLambdas     = Just 0
                 , floatOutConstants   = True
                 , floatOutOverSatApps = False
                 , floatToTopLevelOnly = False
@@ -270,7 +428,8 @@ getCoreToDo dflags hpt_rule_base extra_vars
         -- catch it.  For the record, the redex is
         --        f_el22 (f_el21 r_midblock)
         runWhen full_laziness $ CoreDoFloatOutwards $ FloatOutSwitches
-               { floatOutLambdas     = floatLamArgs dflags
+               { floatCoreMode       = OrdinaryCore
+               , floatOutLambdas     = floatLamArgs dflags
                , floatOutConstants   = True
                , floatOutOverSatApps = True
                , floatToTopLevelOnly = False
@@ -426,24 +585,60 @@ This extra run of the simplifier has a cost, but this is only with -O2.
 ************************************************************************
 -}
 
-runCorePasses :: [CoreToDo] -> ModGuts -> CoreM ModGuts
-runCorePasses passes guts
-  = foldM do_pass guts passes
+-- | Collect top-level binder names mutated or given new user rules by a 'CoreDoPluginPass'.
+pluginMutatedBinders :: ModGuts -> ModGuts -> NameSet
+pluginMutatedBinders before_guts after_guts =
+  let strip_non_code = stripTicksE (not . tickishIsCode)
+      before_flat = flattenBinds (mg_binds before_guts)
+      after_map   = mkNameEnv [ (idName b, (b, rhs)) | (b, rhs) <- flattenBinds (mg_binds after_guts) ]
+      unchanged (b_old, rhs_old)
+        | Just (b_new, rhs_new) <- lookupNameEnv after_map (idName b_old)
+        = idType b_old `eqType` idType b_new &&
+          eqCoreExpr (strip_non_code rhs_old) (strip_non_code rhs_new)
+        | otherwise = False
+      mutated_binds = [ idName b_old | pair@(b_old, _) <- before_flat, not (unchanged pair) ]
+      before_rule_cnt = length (mg_rules before_guts)
+      added_rule_heads =
+        [ fn
+        | length (mg_rules after_guts) /= before_rule_cnt
+        , Rule { ru_auto = False, ru_fn = fn } <- mg_rules after_guts ]
+  in mkNameSet (mutated_binds ++ added_rule_heads)
+
+runCorePasses :: Maybe (IORef NameSet) -> SimplCoreMode -> [CoreToDo] -> ModGuts -> CoreM ModGuts
+runCorePasses mb_mut_ref mode passes guts
+  = do { when (mode == OrdinaryCore) $ liftIO $
+           rejectNativeDependentProgram "the Core optimization pipeline" (mg_binds guts) (mg_rules guts)
+       ; foldM do_pass guts passes }
   where
     do_pass guts CoreDoNothing = return guts
-    do_pass guts (CoreDoPasses ps) = runCorePasses ps guts
+    do_pass guts (CoreDoPasses ps) = foldM do_pass guts ps
     do_pass guts pass = do
       logger <- getLogger
       withTiming logger (ppr pass <+> brackets (ppr mod))
                    (const ()) $ do
-            guts' <- lintAnnots (ppr pass) (doCorePass pass) guts
-            endPass pass (mg_binds guts') (mg_rules guts')
+            guts' <- lintAnnots (ppr pass) (doCorePassFor mb_mut_ref mode pass) guts
+            case pass of
+              CoreDoPluginPass{} -> liftIO $ do
+                when (mode == OrdinaryCore) $
+                  rejectNativeDependentProgram "the output of a Core plugin" (mg_binds guts') (mg_rules guts')
+                case mb_mut_ref of
+                  Just mut_ref -> modifyIORef' mut_ref (`unionNameSet` pluginMutatedBinders guts guts')
+                  Nothing      -> pure ()
+              _ -> pure ()
+            if mode == RetainedCore && hasScopedDictionaryProgram (mg_binds guts')
+              then do
+                hsc_env <- getHscEnv
+                dflags  <- getDynFlags
+                liftIO $ endScopedDictionaryPassIO logger
+                  (initEndPassConfig dflags (interactiveInScope (hsc_IC hsc_env)) alwaysQualify pass)
+                  (mg_binds guts') (mg_rules guts')
+              else endPass pass (mg_binds guts') (mg_rules guts')
             return guts'
 
     mod = mg_module guts
 
-doCorePass :: CoreToDo -> ModGuts -> CoreM ModGuts
-doCorePass pass guts = do
+doCorePassFor :: Maybe (IORef NameSet) -> SimplCoreMode -> CoreToDo -> ModGuts -> CoreM ModGuts
+doCorePassFor mb_mut_ref core_mode pass guts = do
   logger    <- getLogger
   hsc_env   <- getHscEnv
   dflags    <- getDynFlags
@@ -473,7 +668,7 @@ doCorePass pass guts = do
                                  liftIOWithCount $ simplifyPgm logger (hsc_unit_env hsc_env) name_ppr_ctx opts guts
 
     CoreCSE                   -> {-# SCC "CommonSubExpr" #-}
-                                 updateBinds cseProgram
+                                 updateBinds (cseProgramWithMode core_mode)
 
     CoreLiberateCase          -> {-# SCC "LiberateCase" #-}
                                  updateBinds (liberateCase (initLiberateCaseOpts dflags))
@@ -500,12 +695,12 @@ doCorePass pass guts = do
                                  updateBindsM (liftIO . cprAnalProgram logger fam_envs)
 
     CoreDoWorkerWrapper       -> {-# SCC "WorkWrap" #-}
-                                 updateBinds (wwTopBinds
+                                 updateBinds (wwTopBinds core_mode
                                                (initWorkWrapOpts (mg_module guts) dflags fam_envs)
                                                us)
 
     CoreDoSpecialising        -> {-# SCC "Specialise" #-}
-                                 specProgram guts
+                                 specProgram core_mode guts
 
     CoreDoSpecConstr          -> {-# SCC "SpecConstr" #-}
                                  specConstrProgram guts
@@ -522,7 +717,7 @@ doCorePass pass guts = do
     CoreDoRuleCheck phase pat -> {-# SCC "RuleCheck" #-}
                                  ruleCheckPass phase pat guts
     CoreDoNothing             -> return guts
-    CoreDoPasses passes       -> runCorePasses passes guts
+    CoreDoPasses passes       -> runCorePasses mb_mut_ref core_mode passes guts
 
     CoreDoPluginPass _ p      -> {-# SCC "Plugin" #-} p guts
 
@@ -581,6 +776,7 @@ dmdAnal logger before_ww dflags fam_envs rules binds = do
 -- before the first (simple) optimization took place. See #23337
 desugarOpt :: DynFlags -> Logger -> Module -> CoreProgram -> [CoreRule] -> CoreM (CoreProgram,[CoreRule])
 desugarOpt dflags logger mod binds rules = liftIO $ do
+  rejectNativeDependentProgram "simpleOptPgm" binds rules
   let simpl_opts = initSimpleOpts dflags
   let !(ds_binds, ds_rules_for_imps, occ_anald_binds) = simpleOptPgm simpl_opts mod binds rules
 

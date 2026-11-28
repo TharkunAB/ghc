@@ -4,7 +4,7 @@ import GHC.Prelude
 import {-# SOURCE #-} GHC.Core.TyCon
 import {-# SOURCE #-} GHC.Core.TyCo.Rep( Type, Coercion )
 import GHC.Utils.Misc
-import GHC.Types.Var( FunTyFlag, TyVar )
+import GHC.Types.Var( FunTyFlag, TyVar, Id )
 import GHC.Types.Basic( TypeOrConstraint )
 
 
@@ -20,3 +20,18 @@ isLiftedTypeKind :: Type -> Bool
 
 partitionInvisibleTypes :: TyCon -> [Type] -> ([Type], [Type])
 typeTypeOrConstraint    :: HasDebugCallStack => Type -> TypeOrConstraint
+
+coreFullView :: Type -> Type
+isNativeIndexFunctionId :: Id -> Bool
+isNativeDepFunctionId :: Id -> Bool
+nativeIndexFunctionTys_maybe :: Id -> Maybe (Type, Type)
+nativeTermAppKind_maybe :: Id -> Type -> Maybe (Type, Type)
+
+-- | Check the consumed arrow kind for proven nominal matchability.
+isMatchableFunTy :: Type -> Bool
+
+-- | Build an arrow from the actual argument and result sorts.
+mkFunctionType :: HasDebugCallStack => Type -> Type -> Type -> Type -> Type
+
+-- | Test whether a kind has a constraint premise along its Pi spine.
+hasConstraintPremise :: Type -> Bool

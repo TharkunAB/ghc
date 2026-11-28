@@ -67,7 +67,8 @@ module GHC.Types.Name.Occurrence (
         mkDataTOcc, mkDataCOcc, mkDataConWorkerOcc,
         mkSuperDictSelOcc, mkSuperDictAuxOcc,
         mkLocalOcc, mkMethodOcc, mkInstTyTcOcc,
-        mkInstTyCoOcc, mkEqPredCoOcc,
+        mkInstTyCoOcc, mkEqPredCoOcc, mkSourceTableOcc, sourceTableTermOcc,
+        mkSourceFstOcc, mkSourceSndOcc,
         mkTyConRepOcc,
 
         -- ** Deconstruction
@@ -132,6 +133,7 @@ import GHC.Data.FastString
 import GHC.Data.FastString.Env
 
 import Control.DeepSeq
+import qualified Data.ByteString as BS
 import Data.Char
 import Data.Data
 import qualified Data.Semigroup as S
@@ -1066,6 +1068,35 @@ mk_simple_deriv sp px occ = mk_deriv sp px [occNameFS occ]
 -- of the data constructor OccName (which should be a DataName)
 -- to VarName
 mkDataConWorkerOcc datacon_occ = setOccNameSpace varName datacon_occ
+
+-- | Name of the closed family for a finite source function.
+mkSourceTableOcc :: OccName -> OccName
+mkSourceTableOcc occ
+  | Just parent <- fieldOcc_maybe occ
+  = mkTcOcc ("T:field:" ++ show (unpackFS parent) ++ ":" ++ occNameString occ)
+  | otherwise = mk_simple_deriv tcName "T:" occ
+
+-- | Private families for the unevaluated fields of an ordinary pair builder.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
+mkSourceFstOcc, mkSourceSndOcc :: OccName -> OccName
+mkSourceFstOcc = mk_simple_deriv tcName "P1:"
+mkSourceSndOcc = mk_simple_deriv tcName "P2:"
+
+-- | Recover the source function's spelling from its family occurrence.
+sourceTableTermOcc :: OccName -> Maybe OccName
+sourceTableTermOcc occ
+  | isTcOcc occ
+  , let bs = bytesFS (occNameFS occ)
+  , BS.length bs > 2
+  , BS.index bs 0 == 84 -- 'T'
+  , BS.index bs 1 == 58 -- ':'
+  = if "T:field:" `BS.isPrefixOf` bs
+    then case reads (drop 8 (occNameString occ)) of
+           [(parent, ':' : selector)] ->
+             Just (mkOccName (fieldName (mkFastString parent)) selector)
+           _ -> Nothing
+    else Just (mkVarOccFS (mkFastStringByteString (BS.drop 2 bs)))
+  | otherwise = Nothing
 
 mkSuperDictAuxOcc :: Int -> OccName -> OccName
 mkSuperDictAuxOcc index cls_tc_occ

@@ -62,10 +62,11 @@ module GHC.Core.TyCon(
         isNewTyCon, isAbstractTyCon,
         isFamilyTyCon, isOpenFamilyTyCon, famTyConHasInjectivity,
         isTypeFamilyTyCon, isDataFamilyTyCon,
-        isOpenTypeFamilyTyCon,
+        isOpenTypeFamilyTyCon, isConstrainedFamilyTyCon,
+        standaloneFamilyConstrainedKind_maybe,
         closedTypeFamily_maybe,
         builtInClosedTyFamTyCon_maybe,
-        closedFamilyTyConCoAxiom_maybe,
+        closedFamilyTyConCoAxiom_maybe, closedFamilyScope_maybe,
         tyConInjectivityInfo,
         isGadtSyntaxTyCon, isInjectiveTyCon, isGenerativeTyCon,
         isTyConAssoc, tyConAssoc_maybe, tyConFlavourAssoc_maybe,
@@ -89,12 +90,14 @@ module GHC.Core.TyCon(
         tyConStupidTheta,
         tyConArity,
         tyConNullaryTy, mkTyConTy,
+        NativeDomainShape(..), tyConNativeDomainShape, setTyConNativeDomainShape,
         tyConRoles,
         tyConFlavour,
         tyConTuple_maybe, tyConClass_maybe, tyConATs,
         tyConDataFamInst_maybe, tyConDataFamInstSig_maybe, tyConDataFamCoercion_maybe,
         tyConFamilyResVar_maybe,
-        synTyConDefn_maybe, synTyConRhs_maybe,
+        synTyConDefn_maybe, synTyConRhs_maybe, partialSynTyConDefn_maybe,
+        synTyConSourceProofRules, setSynTyConSourceProofRules,
         famTyConFlav_maybe,
         algTyConRhs,
         newTyConRhs, newTyConEtadArity, newTyConEtadRhs,
@@ -112,7 +115,8 @@ module GHC.Core.TyCon(
         ExpandSynResult(..),
         expandSynTyCon_maybe,
         newTyConCo, newTyConCo_maybe,
-        pprPromotionQuote, mkTyConKind,
+        pprPromotionQuote, mkTyConKind, mkTyConKindWithMatchability,
+        tyConFlavourMatchability,
 
         -- ** Predicated on TyConFlavours
         tcFlavourIsOpen,
@@ -148,14 +152,14 @@ import {-# SOURCE #-} GHC.Core.TyCo.Ppr
    ( pprType )
 import {-# SOURCE #-} GHC.Builtin.WiredIn.Types
    ( runtimeRepTyCon, constraintKind, levityTyCon
-   , multiplicityTyCon
+   , multiplicityTyCon, matchabilityTyCon, matchableDataConTy, unmatchableDataConTy
    , vecCountTyCon, vecElemTyCon )
 import {-# SOURCE #-} GHC.Core.DataCon
    ( DataCon, dataConFieldLabels
    , dataConTyCon, dataConFullSig
    , isUnboxedSumDataCon, isTypeDataCon )
 import {-# SOURCE #-} GHC.Core.Type
-   ( isLiftedTypeKind )
+   ( isLiftedTypeKind, hasConstraintPremise )
 import GHC.Builtin.Uniques
   ( tyConRepNameUnique
   , dataConTyRepNameUnique )
@@ -539,13 +543,25 @@ isInferredTyConBinder (Bndr _ tcb_vis) = isInvisInferTcbVis tcb_vis
 
 -- Build the 'tyConKind' from the binders and the result kind.
 -- Keep in sync with 'mkTyConKind' in GHC.Iface.Type.
+-- See Note [Declared arrow matchability].
 mkTyConKind :: [TyConBinder] -> Kind -> Kind
-mkTyConKind bndrs res_kind = foldr mk res_kind bndrs
+mkTyConKind = mkTyConKindWithMatchability matchableDataConTy
+
+-- | Build a constructor kind with the supplied prefix matchability.
+mkTyConKindWithMatchability :: Type -> [TyConBinder] -> Kind -> Kind
+mkTyConKindWithMatchability ma bndrs res_kind = foldr mk res_kind bndrs
   where
     mk :: TyConBinder -> Kind -> Kind
-    mk (Bndr tv (NamedTCB vis)) k = mkForAllTy (Bndr tv vis) k
-    mk (Bndr tv AnonTCB)        k = mkNakedFunTy FTF_T_T (varType tv) k
+    mk (Bndr tv (NamedTCB vis)) k = mkForAllTy ma (Bndr tv vis) k
+    mk (Bndr tv AnonTCB)        k = mkNakedFunTy ma FTF_T_T (varType tv) k
     -- mkNakedFunTy: see Note [Naked FunTy] in GHC.Builtin.WiredIn.Types
+
+-- | Matchability of the anonymous binders in a declaration's argument prefix.
+-- See Note [Declared arrow matchability].
+tyConFlavourMatchability :: TyConFlavour tc -> Type
+tyConFlavourMatchability flav
+  | tcFlavourMustBeSaturated flav = unmatchableDataConTy
+  | otherwise = matchableDataConTy
 
 -- | (mkTyConTy tc) returns (TyConApp tc [])
 -- but arranges to share that TyConApp among all calls
@@ -636,7 +652,7 @@ All TyCons have this group of fields
                               --   NB: Currently (Aug 2018), TyCons that own this
                               --   field really only contain TyVars. So it is
                               --   [TyVar] instead of [TyCoVar].
-  tyConKind      :: Kind      -- Equal to 'mkTyConKind tyConBinders tyConResKind' up to type synonym expansion
+  tyConKind      :: Kind      -- Full supplied kind, including arrow metadata
                               -- See Note [Preserve user-written TyCon kind]
   tyConArity     :: Arity     -- Cached = length tyConBinders
 
@@ -676,8 +692,9 @@ They fit together like so:
 
   tyConKind is the full kind of the TyCon, not just the result kind
 
-  Note that 'mkTyConKind tyConBinders tyConResKind' is only equal to 'tyConKind'
-  up to type synonym expansion, as explained in Note [Preserve user-written TyCon kind].
+  Reconstruct the prefix with the declaration's matchability. The supplied
+  kind can retain synonyms and computed metadata. See
+  Note [Preserve user-written TyCon kind] and Note [Declared arrow matchability].
 
 * For type families, tyConArity is the arguments this TyCon must be
   applied to, to be considered saturated.  Here we mean "applied to in
@@ -788,8 +805,8 @@ data TyCon = TyCon {
         tyConKind             :: Kind,
           -- ^ Kind of this TyCon
           --
-          -- Equal to @mkTyConKind tyConBinders tyConResKind@ only up to
-          -- type synonym expansion, see Note [Preserve user-written TyCon kind]
+          -- Preserve the supplied kind and its arrow metadata.
+          -- See Note [Preserve user-written TyCon kind].
         tyConHasClosedResKind :: Bool,
         tyConEtaBinders :: Int,
           -- ^ How many of the binders were introduced by eta expansion?
@@ -803,11 +820,55 @@ data TyCon = TyCon {
         tyConArity     :: Arity,         -- ^ Arity
         tyConNullaryTy :: Type,          -- ^ A pre-allocated @TyConApp tycon []@
 
+        tyConNativeDomainShape :: Maybe NativeDomainShape,
+          -- ^ Lazy interface information. See Note [Native interface domain shapes].
+
         tyConRoles :: [Role],  -- ^ The role for each type variable
                                -- This list has length = tyConArity
                                -- See also Note [TyCon Role signatures]
 
         tyConDetails :: !TyConDetails }
+
+-- | Independent shapes for native interface domain prechecks.
+-- See Note [Native interface domain shapes].
+data NativeDomainShape
+  = NativeUnknownDomain
+  | NativeInvalidDomain
+  | NativeDataDomain [(NativeDomainShape, NativeDomainShape)]
+  | NativeSynonymDomain NativeDomainShape
+  | NativeTyConDomain TyCon
+  | NativeFunctionDomain NativeDomainShape NativeDomainShape NativeDomainShape NativeDomainShape
+  | NativePiDomain NativeDomainShape NativeDomainShape NativeDomainShape
+
+-- | Attach a derived interface view and update the cached nullary type.
+-- See Note [Native interface domain shapes].
+setTyConNativeDomainShape :: TyCon -> NativeDomainShape -> TyCon
+setTyConNativeDomainShape tc shape = tc'
+  where
+    tc' = tc { tyConNativeDomainShape = Just shape
+             , tyConNullaryTy = mkNakedTyConTy tc' }
+
+{- Note [Native interface domain shapes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An imported constructor field can contain a retained Pi whose domain is its
+own parent. The typed domain checker then needs the field Type before its
+decoder has returned. A visited-TyCon set cannot supply that missing Type.
+
+IfaceToCore derives this small view from raw declarations before it forces
+their fields. References use the existing lazy interface environment. The
+view has no decoded field Types, trusted wire flag, or global name cache.
+Its fields must stay lazy. Existing TyCon builders default to no view.
+
+The view permits early rejection only. The typed checks remain mandatory.
+Unknown includes forms whose normalization is not represented here. In
+contrast, a raw Pi retains endpoint shapes for the ordinary arrow that it can
+become when its binder is vacuous.
+An absent view is not evidence that a domain is valid or empty.
+
+Keep each view on its reconstructed TyCon. When attaching it, rebuild
+tyConNullaryTy so that mkTyConTy refers to that same TyCon and its view.
+See Note [Checking native domain shapes] in GHC.IfaceToCore.
+-}
 
 data TyConDetails =
   -- | Algebraic data types, from
@@ -872,6 +933,9 @@ data TyConDetails =
         synTcRhs     :: Type,    -- ^ Contains information about the expansion
                                  -- of the synonym
 
+        -- See Note [Eta reduction of partial synonyms] in GHC.Core.Type.
+        synEtaRhs :: Maybe ([TyVar], Type),
+
         synIsTau     :: Bool,   -- True <=> the RHS of this synonym does not
                                  --          have any foralls, after expanding any
                                  --          nested synonyms
@@ -888,9 +952,11 @@ data TyConDetails =
                                  -- forgetfulness. False conveys definite information
                                  -- (definitely not forgetful); True is always safe.
 
-        synIsConcrete :: Bool    -- True <= If 'tys' are concrete then the expansion
+        synIsConcrete :: Bool,   -- True <= If 'tys' are concrete then the expansion
                                  --         of (S tys) is definitely concrete
                                  -- But False is always safe
+
+        synSourceProofRules :: [SourceProofRule]
     }
 
   -- | Represents families (both type and data)
@@ -1331,14 +1397,19 @@ data FamTyConFlav
    -- | A closed type family 'TyCon'. See Note [Closed type families].
    | ClosedTypeFamilyTyCon ClosedTyFam -- ^ the equations for this closed type family
 
+   -- | An associated type family guarded by its owning class predicate.
+   | ConstrainedTypeFamilyTyCon
+
 instance Outputable FamTyConFlav where
     ppr (DataFamilyTyCon n) = text "data family" <+> ppr n
     ppr OpenTypeFamilyTyCon = text "open type family"
+    ppr ConstrainedTypeFamilyTyCon = text "constrained type family"
     ppr (ClosedTypeFamilyTyCon ctf) =
       case ctf of
         CTF mb_coax    -> text "closed type family" <+> maybe empty ppr mb_coax
         CTF_Abstract   -> text "abstract closed type family"
         CTF_BuiltIn {} -> text "built-in closed type family"
+        CTF_Scoped _ _ ax -> text "scoped closed type family" <+> ppr ax
 
 {- Note [Closed type families]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2063,8 +2134,24 @@ mkTyCon name kind binders nb_eta_bndrs res_kind roles details
                  -- Cached things
                , tyConArity            = length binders
                , tyConNullaryTy        = mkNakedTyConTy tc
+               , tyConNativeDomainShape = Nothing
                , tyConHasClosedResKind = noFreeVarsOfType res_kind
                , tyConTyVars           = binderVars binders }
+
+{- Note [Declared arrow matchability]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A type family or synonym has U anonymous arrows in its declared argument
+prefix. Data type constructors, promoted constructors and data families
+have M arrows in that prefix.
+The independent result kind can contain either classification. Do not rewrite
+its arrows. Named binders retain the implicit-M invariant in this stage.
+
+The general mkTyCon maker receives full user-written kinds. Preserve these
+kinds. The source checker must reject incompatible explicit metadata before
+it calls this maker. Generated kinds must use the declaration's classification.
+See Note [Checked declaration-kind matchability] in GHC.Tc.Gen.HsType.
+Runtime data-constructor workers use U arrows separately.
+-}
 
 {- Note [Preserve user-written TyCon kind]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2206,16 +2293,35 @@ mkSynonymTyCon :: Name
                -> Kind   -- ^ /result/ kind
                -> [Role]
                -> Type
+               -> Maybe ([TyVar], Type)
                -> Bool -> Bool -> Bool -> Bool
                -> TyCon
-mkSynonymTyCon name kind binders res_kind roles rhs is_tau
+mkSynonymTyCon name kind binders res_kind roles rhs eta_rhs is_tau
                is_fam_free is_forgetful is_concrete
   = mkTyCon name kind binders 0 res_kind roles $
     SynonymTyCon { synTcRhs       = rhs
+                 , synEtaRhs      = eta_rhs
                  , synIsTau       = is_tau
                  , synIsFamFree   = is_fam_free
                  , synIsForgetful = is_forgetful
-                 , synIsConcrete  = is_concrete }
+                 , synIsConcrete  = is_concrete
+                 , synSourceProofRules = [] }
+
+-- | Source method rule dependencies retained when a synonym RHS reduces.
+synTyConSourceProofRules :: TyCon -> [SourceProofRule]
+synTyConSourceProofRules TyCon{tyConDetails = SynonymTyCon{synSourceProofRules = deps}} = deps
+synTyConSourceProofRules _ = []
+
+-- | Attach checked rule dependencies without rebuilding an ordinary synonym.
+setSynTyConSourceProofRules :: TyCon -> [SourceProofRule] -> TyCon
+setSynTyConSourceProofRules tc [] = tc
+setSynTyConSourceProofRules tc@TyCon{tyConDetails = details@SynonymTyCon{}} deps =
+  tc'
+  where
+    -- A nullary application must refer to this same TyCon and its dependencies.
+    tc' = tc { tyConDetails = details { synSourceProofRules = deps }
+             , tyConNullaryTy = mkNakedTyConTy tc' }
+setSynTyConSourceProofRules tc _ = pprPanic "setSynTyConSourceProofRules" (ppr tc)
 
 -- | Create a type family or data family 'TyCon'
 mkFamilyTyCon :: Name
@@ -2226,11 +2332,31 @@ mkFamilyTyCon :: Name
               -> Maybe Name -> FamTyConFlav
               -> Maybe Class -> Injectivity -> TyCon
 mkFamilyTyCon name kind binders nb_eta res_kind resVar flav parent inj
-  = mkTyCon name kind binders nb_eta res_kind (constRoles binders Nominal) $
-    FamilyTyCon { famTcResVar  = resVar
-                , famTcFlav    = flav
-                , famTcParent  = classTyCon <$> parent
-                , famTcInj     = inj }
+  = mkTyCon name effective_kind binders nb_eta res_kind (constRoles binders Nominal) $
+    FamilyTyCon { famTcResVar = resVar
+                , famTcFlav   = flav
+                , famTcParent = effective_parent
+                , famTcInj    = inj }
+  where
+    -- Do not force flav here because forkM axiom knots in GHC.IfaceToCore
+    -- inspect tyConKind before flav is ready.
+    is_standalone_constrained =
+      isNothing parent && hasConstraintPremise kind
+
+    effective_kind
+      | is_standalone_constrained
+      = mkTyConKindWithMatchability unmatchableDataConTy binders res_kind
+      | otherwise
+      = kind
+
+    effective_parent = case parent of
+      Just cls -> Just (classTyCon cls)
+      Nothing
+        | is_standalone_constrained -> Just domain_carrier
+        | otherwise                 -> Nothing
+
+    domain_carrier =
+      mkSynonymTyCon name kind [] constraintKind [] kind Nothing False False False False
 
 -- | Create a promoted data constructor 'TyCon'
 -- Somewhat dodgily, we give it the same Name
@@ -2505,6 +2631,7 @@ isOpenFamilyTyCon (TyCon { tyConDetails = details })
   | FamilyTyCon {famTcFlav = flav } <- details
               = case flav of
                   OpenTypeFamilyTyCon      -> True
+                  ConstrainedTypeFamilyTyCon -> True
                   DataFamilyTyCon {}       -> True
                   ClosedTypeFamilyTyCon {} -> False
   | otherwise = False
@@ -2525,7 +2652,22 @@ isDataFamilyTyCon (TyCon { tyConDetails = details })
 isOpenTypeFamilyTyCon :: TyCon -> Bool
 isOpenTypeFamilyTyCon (TyCon { tyConDetails = details })
   | FamilyTyCon {famTcFlav = OpenTypeFamilyTyCon } <- details = True
+  | FamilyTyCon {famTcFlav = ConstrainedTypeFamilyTyCon } <- details = True
   | otherwise                                                 = False
+
+-- | Return the canonical constrained kind of a standalone constrained type
+-- family, if any.
+standaloneFamilyConstrainedKind_maybe :: TyCon -> Maybe Kind
+standaloneFamilyConstrainedKind_maybe (TyCon { tyConDetails = FamilyTyCon { famTcParent = Just tc } })
+  | not (isClassTyCon tc)
+  = synTyConRhs_maybe tc
+standaloneFamilyConstrainedKind_maybe _ = Nothing
+
+isConstrainedFamilyTyCon :: TyCon -> Bool
+isConstrainedFamilyTyCon tc
+  | Just ConstrainedTypeFamilyTyCon <- famTyConFlav_maybe tc = True
+  | isJust (standaloneFamilyConstrainedKind_maybe tc) = True
+  | otherwise = False
 
 -- | Is this the 'TyCon' of a closed type family?
 closedTypeFamily_maybe :: TyCon -> Maybe ClosedTyFam
@@ -2547,11 +2689,15 @@ closedTypeFamily_maybe (TyCon { tyConDetails = details })
 -- Only use this function if you are /sure/ you do not need to handle built-in
 -- closed type families.
 closedFamilyTyConCoAxiom_maybe :: TyCon -> Maybe (CoAxiom Branched)
-closedFamilyTyConCoAxiom_maybe tc
-  | Just (CTF mb_coax) <- closedTypeFamily_maybe tc
-  = mb_coax
-  | otherwise
-  = Nothing
+closedFamilyTyConCoAxiom_maybe tc =
+  closedTypeFamily_maybe tc >>= closedTyFamCoAxiom_maybe
+
+-- | The lexical owner and source-codomain flag of a checked private family.
+closedFamilyScope_maybe :: TyCon -> Maybe (Name, Bool)
+closedFamilyScope_maybe tc
+  | Just (CTF_Scoped owner is_sum _) <- closedTypeFamily_maybe tc
+  = Just (owner, is_sum)
+  | otherwise = Nothing
 
 builtInClosedTyFamTyCon_maybe :: TyCon -> Maybe BuiltinClosedTyFam
 builtInClosedTyFamTyCon_maybe tc
@@ -2581,6 +2727,7 @@ famTyConHasInjectivity (TyCon { tyConDetails = details })
         ClosedTypeFamilyTyCon ctf ->
           case ctf of
             CTF (Just {}) -> True
+            CTF_Scoped {}  -> True
             CTF_BuiltIn {} -> True
             _ -> False
         _ -> False
@@ -2725,7 +2872,7 @@ kindTyConKeys = fromListUniqueSet $
   --   of these can successfully be used without DataKinds.
   [ liftedTypeKindTyConKey, liftedRepTyConKey, constraintKindTyConKey, tYPETyConKey, cONSTRAINTTyConKey ]
   ++ concatMap tycon_with_datacons [ runtimeRepTyCon, levityTyCon
-                                   , multiplicityTyCon
+                                   , multiplicityTyCon, matchabilityTyCon
                                    , vecCountTyCon, vecElemTyCon ]
   where
     tycon_with_datacons tc = getUnique tc : map getUnique (tyConDataCons tc)
@@ -2755,7 +2902,7 @@ isImplicitTyCon (TyCon { tyConName = name, tyConDetails = details }) = go detail
     go (PromotedDataCon {}) = True
     go (SynonymTyCon {})    = False
     go (TcTyCon {})         = False
-    go (FamilyTyCon { famTcParent = parent }) = isJust parent
+    go (FamilyTyCon { famTcParent = parent }) = maybe False isClassTyCon parent
     go (AlgTyCon { algTcRhs = rhs })
        | TupleTyCon {} <- rhs = isWiredInName name
        | SumTyCon {} <- rhs   = True
@@ -2878,7 +3025,7 @@ expandSynTyCon_maybe
 -- ^ Expand a type synonym application
 -- Return Nothing if the TyCon is not a synonym,
 -- or if not enough arguments are supplied
-expandSynTyCon_maybe (TyCon { tyConTyVars = tvs, tyConArity = arity
+expandSynTyCon_maybe tc@(TyCon { tyConTyVars = tvs, tyConArity = arity
                             , tyConDetails = details }) tys
   | SynonymTyCon { synTcRhs = rhs } <- details
   = if arity == 0
@@ -2886,7 +3033,9 @@ expandSynTyCon_maybe (TyCon { tyConTyVars = tvs, tyConArity = arity
     else case tys `listLengthCmp` arity of
               GT -> ExpandsSyn (tvs `zip` tys) rhs (drop arity tys)
               EQ -> ExpandsSyn (tvs `zip` tys) rhs []
-              LT -> NoExpansion
+              LT | Just (eta_tvs, eta_rhs) <- partialSynTyConDefn_maybe tc tys
+                 -> ExpandsSyn (zip eta_tvs tys) eta_rhs (dropList eta_tvs tys)
+                 | otherwise -> NoExpansion
    | otherwise
    = NoExpansion
 
@@ -3040,6 +3189,13 @@ synTyConDefn_maybe (TyCon { tyConTyVars = tyvars, tyConDetails = details })
   = Just (tyvars, ty)
   | otherwise
   = Nothing
+
+-- | Return the shorter definition when its binders have all been supplied.
+-- See Note [Eta reduction of partial synonyms] in GHC.Core.Type.
+partialSynTyConDefn_maybe :: TyCon -> [a] -> Maybe ([TyVar], Type)
+partialSynTyConDefn_maybe (TyCon { tyConDetails = SynonymTyCon { synEtaRhs = Just def@(tvs, _) } }) args
+  | tvs `leLength` args = Just def
+partialSynTyConDefn_maybe _ _ = Nothing
 
 -- | Extract the information pertaining to the right hand side of a type synonym
 -- (@type@) declaration.
@@ -3199,10 +3355,12 @@ tyConFlavour (TyCon { tyConDetails = details })
                   AbstractTyCon {}   -> AbstractTypeFlavour
 
   | FamilyTyCon { famTcFlav = flav, famTcParent = parent } <- details
+  , let assoc_parent = parent >>= \tc -> if isClassTyCon tc then Just tc else Nothing
   = case flav of
-      DataFamilyTyCon{}       -> OpenFamilyFlavour (IAmData DataType) parent
-      OpenTypeFamilyTyCon     -> OpenFamilyFlavour IAmType parent
-      ClosedTypeFamilyTyCon{} -> ClosedTypeFamilyFlavour
+      DataFamilyTyCon{}          -> OpenFamilyFlavour (IAmData DataType) assoc_parent
+      OpenTypeFamilyTyCon        -> OpenFamilyFlavour IAmType assoc_parent
+      ConstrainedTypeFamilyTyCon -> OpenFamilyFlavour IAmType assoc_parent
+      ClosedTypeFamilyTyCon{}    -> ClosedTypeFamilyFlavour
 
   | SynonymTyCon {} <- details                  = TypeSynonymFlavour
   | PrimTyCon {} <- details                     = BuiltInTypeFlavour

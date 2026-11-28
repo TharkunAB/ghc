@@ -10,6 +10,8 @@ import {-# SOURCE #-} GHC.Types.Name (Name)
 listTyCon :: TyCon
 typeSymbolKind :: Type
 charTy :: Type
+charPrimLitTyCon :: TyCon
+boolTy :: Type
 mkBoxedTupleTy :: [Type] -> Type
 
 coercibleTyCon, heqTyCon :: TyCon
@@ -81,3 +83,8 @@ cTupleSelIdName :: ConTag -> Arity -> Name
 
 sumDataCon :: ConTag -> Arity -> DataCon
 sumTyCon :: Arity -> TyCon
+
+matchabilityTyCon :: TyCon
+matchabilityTy :: Type
+matchableDataConTy, unmatchableDataConTy :: Type
+matchableDataConTyCon, unmatchableDataConTyCon :: TyCon

@@ -87,6 +87,7 @@ import GHC.Prelude
 
 import GHC.Core
 import GHC.Core.Opt.Monad ( FloatOutSwitches(..) )
+import GHC.Core.Opt.OccurAnal (SimplCoreMode(..))
 import GHC.Core.Utils
 import GHC.Core.Opt.Arity   ( exprBotStrictness_maybe, isOneShotBndr )
 import GHC.Core.FVs     -- all of it
@@ -97,7 +98,8 @@ import GHC.Core.Make    ( sortQuantVars )
 import GHC.Core.Make.Box ( mkCanonicalCo )
 import GHC.Core.Coercion ( MCoercion(..), MCoercionR, mkSymMCo )
 import GHC.Core.DataCon ( DataCon, dataConTyCon )
-import GHC.Core.Type    ( Type, mightBeUnliftedType, typeHasFixedRuntimeRep
+import GHC.Core.TyCo.Rep (Type(DepFunTy, DepDictTy))
+import GHC.Core.Type    ( Type, coreFullView, mightBeUnliftedType, typeHasFixedRuntimeRep
                         , mkTyConTy, getRuntimeRep )
 import GHC.Core.Multiplicity     ( pattern ManyTy )
 
@@ -351,6 +353,10 @@ lvlExpr env (_, AnnTick tickish expr) = do
     let tickish' = substTickish (le_subst env) tickish
     return (Tick tickish' expr')
 
+-- See Note [Floating bindings across erased packages].
+lvlExpr env expr@(_, AnnPack{})   = return (keepBindingsInPlace env (deAnnotate expr))
+lvlExpr env expr@(_, AnnUnpack{}) = return (keepBindingsInPlace env (deAnnotate expr))
+
 lvlExpr env expr@(_, AnnApp _ _) = lvlApp env expr (collectAnnArgs expr)
 
 -- We don't split adjacent lambdas.  That is, given
@@ -383,8 +389,25 @@ lvlExpr env (_, AnnLet bind body)
        ; return (Let bind' body') }
 
 lvlExpr env (_, AnnCase scrut case_bndr ty alts)
-  = do { scrut' <- lvlNonTailMFE env True scrut
+  = do { scrut' <- if floatCoreMode (le_switches env) == RetainedCore
+                       && any has_proof alts
+                   then return (keepBindingsInPlace env (deAnnotate scrut))
+                   else lvlNonTailMFE env True scrut
+                   -- See Note [Floating native index scrutinees].
        ; lvlCase env (freeVarsOf scrut) scrut' case_bndr ty alts }
+  where
+    has_proof alt = let core_alt = deAnnAlt alt
+                    in isNativeIndexAlt core_alt || isNativeIndexAliasAlt core_alt
+
+{- Note [Floating native index scrutinees]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A native case proof refers to the index of its whole scrutinee. If we float
+the scrutinee S Z as lvl = S Z, the case inspects lvl but its proof still
+refers to 'S 'Z. Floating a constructor argument has the same problem.
+Keep the scrutinee in place and apply the lexical substitution to its
+expressions and annotations. The case alternatives and surrounding
+bindings still participate in the usual float-out transformations.
+-}
 
 lvlNonTailExpr :: LevelEnv             -- Context
                -> CoreExprWithFVs      -- Input expression
@@ -397,6 +420,24 @@ lvlApp :: LevelEnv
        -> CoreExprWithFVs
        -> (CoreExprWithFVs, [CoreExprWithFVs]) -- Input application
        -> LvlM LevelledExpr                    -- Result expression
+lvlApp env _ (fun, args)
+  | floatCoreMode (le_switches env) == RetainedCore
+  , not (isRunRW fun)
+  = do { fun' <- lvlExpr env fun
+       ; args' <- retainedArgs (exprType (deAnnotate fun)) args
+       ; return (foldl' App fun' args') }
+  where
+    isRunRW (_, AnnVar fn) = fn `hasKey` runRWKey
+    isRunRW _ = False
+
+    retainedArgs _ [] = return []
+    retainedArgs ty (arg : rest) = do
+      let expr = deAnnotate arg
+      arg' <- case coreFullView ty of
+        DepFunTy{} -> return (keepBindingsInPlace env expr)
+        _ -> lvlMFE env False arg
+      rest' <- retainedArgs (applyTypeToArgs ty [expr]) rest
+      return (arg' : rest')
 lvlApp env orig_expr ((_,AnnVar fn), args)
   -- Try to ensure that runRW#'s continuation isn't floated out.
   -- See Note [Simplification of runRW#].
@@ -437,6 +478,37 @@ lvlApp env _ (fun, args)
      do { args' <- mapM (lvlNonTailMFE env False) args
         ; fun'  <- lvlNonTailExpr env fun
         ; return (foldl' App fun' args') }
+
+{- Note [Floating bindings across erased packages]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unpack introduces a type witness and a lazy payload binder. Floating a
+binding across the witness can take its type out of scope. Floating a
+strict case across the payload can change when the package is evaluated.
+Apply the outer substitution and keep the bindings inside each operation
+in place. FloatOut removes their level tags. Retained index arguments use
+the same traversal to preserve the expression checked as an index.
+-}
+
+-- | Apply the level environment's substitution and pin each binder at this level.
+keepBindingsInPlace :: LevelEnv -> CoreExpr -> LevelledExpr
+keepBindingsInPlace env = go . substExpr (le_subst env)
+  where
+    tag b = stayPut (le_ctxt_lvl env) b
+    go (Var v) = Var v
+    go (Lit l) = Lit l
+    go (Type t) = Type t
+    go (Coercion c) = Coercion c
+    go (App f a) = App (go f) (go a)
+    go (Cast e co) = Cast (go e) co
+    go (Tick t e) = Tick t (go e)
+    go (Lam b e) = Lam (tag b) (go e)
+    go (Pack schema witness payload) = Pack schema witness (go payload)
+    go (Unpack w p e body) = Unpack (tag w) (tag p) (go e) (go body)
+    go (Let bind e) = Let (tagBind bind) (go e)
+    go (Case e b t alts) = Case (go e) (tag b) t (map tagAlt alts)
+    tagBind (NonRec b rhs) = NonRec (tag b) (go rhs)
+    tagBind (Rec pairs) = Rec [(tag b, go rhs) | (b, rhs) <- pairs]
+    tagAlt (Alt con bs rhs) = Alt con (map tag bs) (go rhs)
 
 -------------------------------------------
 lvlCase :: LevelEnv             -- Level of in-scope names/tyvars
@@ -619,6 +691,7 @@ lvlMFE env strict_ctxt e@(_, AnnCase {})
 lvlMFE env strict_ctxt ann_expr
   |  notWorthFloating expr abs_vars
   || not float_me
+  || hasRuntimeIndexRefs env fvs_ty
   || floatTopLvlOnly env && not (isTopLvl dest_lvl)
          -- Only floating to the top level is allowed.
   || hasFreeJoin env fvs   -- If there is a free join, don't float
@@ -1283,6 +1356,10 @@ lvlBind env (AnnNonRec bndr rhs)
   || isCoVar bndr  -- Don't float CoVars: difficult to fix up CoVar occurrences
                    --                     (see extendPolyLvlEnv)
   || not (wantToFloat env NonRecursive dest_lvl is_join is_top_bindable)
+  || hasRuntimeIndexRefs env ty_fvs
+  || (floatCoreMode (le_switches env) == RetainedCore
+      && not (null abs_vars) && keepIndexBinder env bndr)
+     -- See Note [Floating index binders].
   = -- No float
     do { rhs' <- lvlRhs env NonRecursive is_bot_lam mb_join_arity rhs
        ; let  bind_lvl        = incMinorLvl (le_ctxt_lvl env)
@@ -1329,6 +1406,9 @@ lvlBind env (AnnNonRec bndr rhs)
 
 lvlBind env (AnnRec pairs)
   |  not (wantToFloat env Recursive dest_lvl is_join is_top_bindable)
+  || hasRuntimeIndexRefs env ty_fvs
+  || (floatCoreMode (le_switches env) == RetainedCore
+      && not (null abs_vars) && any (keepIndexBinder env) bndrs)
   = -- No float
     do { let bind_lvl       = incMinorLvl (le_ctxt_lvl env)
              (env', bndrs') = substAndLvlBndrs Recursive env bind_lvl bndrs
@@ -1630,6 +1710,55 @@ destLevel env fvs fvs_ty is_function is_bot
     as_far_as_poss = maxFvLevel' idsOnly env fvs_ty
                      -- See Note [Floating and kind casts]
 
+-- | Keep the lexical binding if type abstraction would change a runtime index.
+-- See Note [Floating index binders].
+keepIndexBinder :: LevelEnv -> Id -> Bool
+keepIndexBinder env b = isRetainedUserUnfolding (realIdUnfolding b)
+                     || b `elemVarSet` le_index_uses env
+
+-- | Collect the local variables in the retained operand of an application.
+retainedOperandVars :: CoreExpr -> CoreExpr -> VarSet
+retainedOperandVars fun arg
+  | isValArg arg
+  = case coreFullView (exprType fun) of
+      DepFunTy _ b body | not (isVacuousRetainedBinder b body) -> exprFreeIds arg
+      DepDictTy{} -> exprFreeIds arg
+      _ -> emptyVarSet
+  | otherwise = emptyVarSet
+
+{- Note [Floating index binders]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A callback used as a retained index must keep its lexical identity.
+Worker/wrapper can replace an absent polymorphic callback with a lazy
+local binding. If full laziness abstracts its free type variables, the
+callback becomes an application such as poly_f @a @r. Core cannot use
+that application as the index of the original call.
+
+Collect the local variables in retained operands and in types and
+coercions, including stable unfoldings, before setting levels. Test the
+original binder before it is cloned. The set is needed only in retained
+Core when floating would abstract variables. Floating without abstraction
+can still rename the binder. See Note [Floating retained user unfoldings]
+and Note [Local indices across Core Tidy] in GHC.Iface.Tidy.
+-}
+
+-- | Keep the binding scope of the free runtime indices in a float's type.
+-- See Note [Floating a dependent result].
+hasRuntimeIndexRefs :: LevelEnv -> TyCoVarSet -> Bool
+hasRuntimeIndexRefs _ refs =
+    anyVarSet (\v -> isId v && not (isCoVar v)) refs
+
+{- Note [Floating a dependent result]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Do not float an expression or binding whose result type contains a free
+runtime Id. A new top-level binder cannot name the local Id in its type.
+The ordinary abstraction path also cannot introduce a dependent lambda
+and rewrite its applications. Keep these bindings in their existing scope
+until floating supports that abstraction. Free coercion variables still
+use the existing level constraint. A closed dependent arrow has no free
+runtime Id and can float.
+-}
+
 {- Note [Floating and kind casts]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Consider this
@@ -1692,6 +1821,7 @@ countFreeIds = nonDetStrictFoldUDFM add 0 . getUniqDSet
 
 data LevelEnv
   = LE { le_switches :: FloatOutSwitches
+       , le_index_uses :: VarSet        -- Pre-cloned variables; see Note [Floating index binders].
        , le_ctxt_lvl :: Level           -- The current level
        , le_lvl_env  :: VarEnv Level    -- Domain is *post-cloned* TyVars and Ids
 
@@ -1737,6 +1867,7 @@ The domain of the le_lvl_env is the *post-cloned* Ids
 initialEnv :: FloatOutSwitches -> CoreProgram -> LevelEnv
 initialEnv float_lams binds
   = LE { le_switches  = float_lams
+       , le_index_uses = bindsAnnotationVarsWith retainedOperandVars binds
        , le_ctxt_lvl  = tOP_LEVEL
        , le_lvl_env   = emptyVarEnv
        , le_subst     = mkEmptySubst in_scope_toplvl
@@ -1868,6 +1999,16 @@ type LvlM result = UniqSM result
 
 initLvl :: UniqSupply -> UniqSM a -> a
 initLvl = initUs_
+
+{- Note [Floating retained user unfoldings]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Stable user unfoldings can contain retained Core, including references to
+variables in a local binding's scope. Cloning with substitution preserves
+the template and its source tag. Floating with abstraction would replace
+the template with metadata for a new function. Keep a marked binding in
+scope when floating would require abstraction. The simplifier applies the
+same restriction in simplLazyBind in GHC.Core.Opt.Simplify.Iteration.
+-}
 
 newPolyBndrs :: Level -> LevelEnv -> [OutVar] -> [InId]
              -> LvlM (LevelEnv, [OutId])

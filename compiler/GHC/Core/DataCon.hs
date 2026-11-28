@@ -16,13 +16,14 @@ module GHC.Core.DataCon (
 
         -- ** Equality specs
         EqSpec, mkEqSpec, eqSpecTyVar, eqSpecType,
-        eqSpecPair, eqSpecPreds,
+        eqSpecPair, eqSpecPreds, buildGadtProofs_maybe, dataConGadtProof_maybe,
+        dataConGadtSourceCoercions_maybe,
 
         -- ** Field labels
         FieldLabel(..), flLabel, FieldLabelString,
 
         -- ** Type construction
-        mkDataCon, fIRST_TAG,
+        mkDataCon, mkDataConWithRetainedArgs, mkDataConWithTelescope, fIRST_TAG,
 
         -- ** Type deconstruction
         dataConRepType, dataConInstSig, dataConFullSig,
@@ -32,11 +33,15 @@ module GHC.Core.DataCon (
         dataConUnivTyVars, dataConExTyCoVars, dataConUnivAndExTyCoVars,
         dataConConcreteTyVars,
         dataConUserTyVars, dataConUserTyVarBinders,
-        dataConTheta,
+        dataConTerminalOrder, dataConLateTyVarCount, dataConUserTyVarGroups, dataConHasTrailingContext,
+        dataConSourceOrder, dataConInteriorContext, dataConContextFieldCount, dataConInteriorForAll,
+        orderedConArgsHaveScope,
+        dataConTheta, dataConHasRetainedResult, validRetainedResultEqSpec,
+        retainedResultFields_maybe, validRetainedResultKind,
         dataConStupidTheta,
-        dataConOtherTheta,
+        dataConOtherTheta, validRetainedConTheta,
         dataConInstArgTys, dataConOrigArgTys, dataConOrigResTy,
-        dataConInstOrigArgTys, dataConRepArgTys, dataConResRepTyArgs,
+        dataConInstOrigArgTys, dataConRepArgTys, dataConRepArgBinders, dataConResRepTyArgs,
         dataConInstUnivs,
         dataConFieldLabels, dataConFieldType, dataConFieldType_maybe,
         dataConSrcBangs,
@@ -62,7 +67,8 @@ module GHC.Core.DataCon (
         specialPromotedDc,
 
         -- ** Promotion related functions
-        promoteDataCon
+        promoteDataCon, promotedRetainedFields, dataConHasPromotedRetained,
+        dataConHasPromotedRetainedSiblings, validRetainedRecordFields
     ) where
 
 import GHC.Prelude
@@ -74,8 +80,9 @@ import GHC.Core.Type as Type
 import GHC.Core.Coercion
 import GHC.Core.Unify
 import GHC.Core.TyCon
+import GHC.Core.TyCo.Rep ( Type(..) )
 import GHC.Core.TyCo.Subst
-import GHC.Core.TyCo.Compare( eqType )
+import GHC.Core.TyCo.Compare( eqType, eqTypes )
 import GHC.Core.Multiplicity
 import {-# SOURCE #-} GHC.Types.TyThing
 import GHC.Types.FieldLabel
@@ -83,8 +90,11 @@ import GHC.Types.SourceText
 import GHC.Core.Class
 import GHC.Types.Name
 import GHC.Builtin.KnownKeys
+import {-# SOURCE #-} GHC.Builtin.WiredIn.Types (unmatchableDataConTy)
 import GHC.Core.Predicate
+import {-# SOURCE #-} GHC.Types.Id.Info ( invisibleRetainedIdInfo )
 import GHC.Types.Var
+import GHC.Types.Var.Set
 import GHC.Types.Var.Env
 import GHC.Types.Basic
 import GHC.Data.FastString
@@ -93,6 +103,7 @@ import GHC.Utils.Binary
 import GHC.Types.Unique ( UniqueTag (BoxingTyConTag), unpkUnique )
 import GHC.Types.Unique.FM ( UniqFM )
 import GHC.Types.Unique.Set
+import GHC.Types.Unique.Supply ( UniqSupply, takeUniqFromSupply )
 import GHC.Builtin.Uniques( mkAlphaTyVarUnique )
 import GHC.Data.Graph.UnVar  -- UnVarSet and operations
 
@@ -107,7 +118,8 @@ import qualified Data.ByteString.Builder as BSB
 import qualified Data.ByteString.Lazy    as LBS
 import qualified Data.Data as Data
 import Data.Char
-import Data.List( find )
+import Data.List( find, mapAccumL )
+import Data.Maybe ( isJust, isNothing )
 
 {-
 Note [Data constructor representation]
@@ -458,6 +470,7 @@ data DataCon
         --    with the set of dcUnivTyVars whose tyvars do not appear in dcEqSpec
         -- So dcUserTyVarBinders is a subset of (dcUnivTyVars ++ dcExTyCoVars)
         -- See Note [DataCon user type variable binders]
+        dcSourceOrder :: !ConSourceOrder,
         dcUserTyVarBinders :: [TyVarBinder],
 
         dcEqSpec :: [EqSpec],   -- Equalities derived from the result type,
@@ -500,6 +513,8 @@ data DataCon
                 -- the wrapper Id, because that makes it harder to use the wrap-id
                 -- to rebuild values after record selection or in generics.
 
+        dcOrigArgBinders :: [Maybe Id], -- Retained field binders; [] for ordinary fields
+                                       -- See Note [Retained constructor field telescopes].
         dcOrigArgTys :: [Scaled Type],  -- Original argument types
                                         -- (before unboxing and flattening of strict fields)
         dcOrigResTy :: Type,            -- Original result type, as seen by the user
@@ -900,6 +915,199 @@ eqSpecPreds :: [EqSpec] -> ThetaType
 eqSpecPreds spec = [ mkNomEqPred (mkTyVarTy tv) ty
                    | EqSpec tv ty <- spec ]
 
+-- | A worker field and any coercion needed to recover the source endpoints.
+type GadtProofField = (PredType, Maybe (Either Coercion Coercion))
+
+-- | Build a proof field using evidence from earlier worker binders.
+type GadtProofStep = LiftingContext -> GadtProofField
+
+-- | Build the worker binders for a source GADT. See Note [Kind evidence in GADT workers].
+buildGadtProofs_maybe :: UniqSupply -> [EqSpec] -> Maybe ([CoVar], UniqSupply)
+buildGadtProofs_maybe us spec = do
+  (lc, binders, _) <- gadtKindTransport_maybe spec
+  let ((rest, _), cvs) = mapAccumL build (us, lc) binders
+  return (cvs, rest)
+  where
+    build (supply, lc) (tv, step) =
+      let (unique, rest) = takeUniqFromSupply supply
+          field = step lc
+          cv = mkCoVar (mkSystemVarName unique (fsLit "ck")) (fst field)
+      in ((rest, extendGadtProof lc tv field cv), cv)
+
+-- | The initial lifting context, ordered binder steps, and remaining fields.
+gadtKindTransport_maybe
+  :: [EqSpec] -> Maybe (LiftingContext, [(TyVar, GadtProofStep)], [GadtProofStep])
+gadtKindTransport_maybe spec@(_:_:_)
+  | not (null prefix), not (null indices)
+  = do { binders <- sequence binder_steps
+       ; fields <- traverse (transport prefix) indices
+       ; return (emptyLiftingContext in_scope, binders, fields) }
+  where
+    (homogeneous, suffix) = span is_homogeneous spec
+    needed = tyCoVarsOfTypes [tyVarKind (eqSpecTyVar eq) | eq <- suffix, not (is_homogeneous eq)]
+    last_needed = last (0 : [i | (i, eq) <- zip [1..] suffix, eqSpecTyVar eq `elemVarSet` needed])
+    (extra, indices) = splitAt last_needed suffix
+    prefix = homogeneous ++ extra
+
+    (_, binder_steps) = mapAccumL plan_step [] prefix
+    plan_step prev eq = (eq : prev, (,) (eqSpecTyVar eq) <$> transport prev eq)
+    is_homogeneous (EqSpec tv rhs) = tyVarKind tv `eqType` typeKind rhs
+    in_scope = mkInScopeSet (tyCoVarsOfTypes (map eqSpecType spec ++ map (tyVarKind . eqSpecTyVar) spec))
+
+    transport earlier (EqSpec tv rhs_index)
+      | lhs_kind `eqType` rhs_kind
+      = Just (const (mkNomEqPred lhs_index rhs_index, Nothing))
+      | canLiftGadtKind lhs_kind
+      , allVarSet independent (tyCoVarsOfType lhs_kind)
+      , substTyWithInScope in_scope kvs rhses lhs_kind `eqType` rhs_kind
+      = Just $ \lc ->
+          let kind_co = liftCoSubst Nominal lc lhs_kind
+          in if isTyVarTy rhs_index
+             then ( mkNomEqPred (mkCastTy lhs_index kind_co) rhs_index
+                  , Just (Left (mkGReflRightCo Nominal lhs_index kind_co)) )
+             else ( mkNomEqPred lhs_index (mkCastTy rhs_index (mkSymCo kind_co))
+                  , Just (Right (mkGReflLeftCo Nominal rhs_index (mkSymCo kind_co))) )
+      | otherwise
+      = Nothing
+      where
+        (kvs, rhses) = unzip (map eqSpecPair earlier)
+        refined = mkVarSet kvs
+        independent v = isTyVar v &&
+          (v `elemVarSet` refined || disjointVarSet refined (expandedTyVars (tyVarKind v)))
+        lhs_index = mkTyVarTy tv
+        lhs_kind = tyVarKind tv
+        rhs_kind = typeKind rhs_index
+
+        canLiftGadtKind (TyVarTy {}) = True
+        canLiftGadtKind (LitTy {}) = True
+        canLiftGadtKind (AppTy f a) = canLiftGadtKind f && canLiftGadtKind a
+        canLiftGadtKind (TyConApp _ args) = all canLiftGadtKind args
+        canLiftGadtKind (FunTy _ ma mult arg res) =
+          canLiftGadtKind ma && canLiftGadtKind mult && canLiftGadtKind arg && canLiftGadtKind res
+        canLiftGadtKind (ForAllTy ma (Bndr b _) body) =
+          isTyVar b && canLiftGadtKind ma && canLiftGadtKind (varType b) && canLiftGadtKind body
+        canLiftGadtKind (CastTy ty co) =
+          canLiftGadtKind ty && allVarSet independent (tyCoVarsOfCo co)
+        canLiftGadtKind _ = False
+
+        expandedTyVars ty
+          | Just ty' <- coreView ty = expandedTyVars ty'
+        expandedTyVars (TyVarTy v) = unitVarSet v
+        expandedTyVars (AppTy f a) = expandedTyVars f `unionVarSet` expandedTyVars a
+        expandedTyVars (TyConApp _ args) = mapUnionVarSet expandedTyVars args
+        expandedTyVars (FunTy _ ma mult arg res) =
+          expandedTyVars ma `unionVarSet` expandedTyVars mult
+            `unionVarSet` expandedTyVars arg `unionVarSet` expandedTyVars res
+        expandedTyVars (ForAllTy ma (Bndr b _) body) =
+          expandedTyVars ma `unionVarSet` expandedTyVars (varType b)
+            `unionVarSet` delVarSet (expandedTyVars body) b
+        expandedTyVars (CastTy ty co) = expandedTyVars ty `unionVarSet` tyCoVarsOfCo co
+        expandedTyVars (CoercionTy co) = tyCoVarsOfCo co
+        expandedTyVars ty = tyCoVarsOfType ty
+gadtKindTransport_maybe _ = Nothing
+
+-- | Extend a lifting context with the original equality represented by a binder.
+extendGadtProof :: LiftingContext -> TyVar -> GadtProofField -> CoVar -> LiftingContext
+extendGadtProof lc tv field cv =
+  extendLiftingContextAndInScope lc tv (restoreGadtProof id field (mkCoVarCo cv))
+
+-- | Use the inverse transport to recover the original endpoints.
+restoreGadtProof :: (Coercion -> Coercion) -> GadtProofField -> Coercion -> Coercion
+restoreGadtProof _ (_, Nothing) co = co
+restoreGadtProof inst (_, Just (Left before)) co = inst before `mkTransCo` co
+restoreGadtProof inst (_, Just (Right after)) co = co `mkTransCo` inst after
+
+-- | The worker proof binders and the types of its remaining proof fields.
+dataConGadtProof_maybe :: DataCon -> Maybe ([CoVar], ThetaType)
+dataConGadtProof_maybe con = do
+  (_, cvs, _, fields) <- dataConGadtFields_maybe con
+  return (cvs, map fst fields)
+
+-- | Validate the stored binders in worker order and reconstruct each field.
+dataConGadtFields_maybe :: DataCon -> Maybe ([TyVar], [CoVar], [GadtProofField], [GadtProofField])
+dataConGadtFields_maybe (MkData { dcExTyCoVars = exs, dcEqSpec = spec })
+  | (source_exs, cvs@(_:_)) <- span isTyVar exs
+  = do { (initial, binders, fields) <- gadtKindTransport_maybe spec
+       ; (lc, bound_fields) <- check initial binders cvs
+       ; return (source_exs, cvs, bound_fields, map ($ lc) fields) }
+  where
+    check lc [] [] = Just (lc, [])
+    check lc ((tv, step) : bs) (cv : rest)
+      | isCoVar cv, let field = step lc, varType cv `eqType` fst field
+      = do { (lc', fields) <- check (extendGadtProof lc tv field cv) bs rest
+           ; return (lc', field : fields) }
+    check _ _ _ = Nothing
+dataConGadtFields_maybe _ = Nothing
+
+-- | Recover the source equalities from the proofs bound in a GADT pattern.
+-- The caller supplies the instantiated universal and source existential
+-- arguments in order and the Givens in worker order. The result only
+-- contains the restored EqSpec proofs.
+-- See Note [Kind evidence in GADT workers].
+dataConGadtSourceCoercions_maybe :: DataCon -> [Type] -> [EvVar] -> Maybe [Coercion]
+dataConGadtSourceCoercions_maybe con source_tys evs = do
+  (source_exs, cvs, bound_fields, fields) <- dataConGadtFields_maybe con
+  let (prefix_evs, rest_evs) = splitAtList cvs evs
+      (index_evs, context_evs) = splitAtList fields rest_evs
+      proof_evs = prefix_evs ++ index_evs
+      subst = foldl2 extendCvSubstWithClone
+                (zipTvSubst (dataConUnivTyVars con ++ source_exs) source_tys)
+                cvs prefix_evs
+  assertPpr (all isCoVar proof_evs && prefix_evs `equalLength` cvs
+             && index_evs `equalLength` fields
+             && context_evs `equalLength` dataConOtherTheta con)
+            (ppr con $$ ppr evs) $
+    return (zipWith (restoreGadtProof (substCo subst))
+                    (bound_fields ++ fields) (map mkCoVarCo proof_evs))
+
+{- Note [Kind evidence in GADT workers]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A source GADT can have earlier EqSpecs that relate the kinds of its
+later index EqSpecs. The source EqSpecs follow the order of the
+universal binders. Bind the initial homogeneous proofs as existential
+CoVars. If a later kind mentions a refined index, extend this prefix
+through the proof for that index. Build each binder using earlier
+binders only. The wrapper supplies reflexive proofs in source order.
+
+Check that substituting earlier EqSpecs into each heterogeneous
+index kind gives the kind of the other index. Lift their nominal
+proofs over the kind. A transported binder supplies a homogeneous
+proof. Compose it with its inverse transport to extend the lifting
+context with the original endpoints. For a later kind At a, the
+lift can then use the proof for a as well as the proof for its kind.
+
+When the right index is a type variable, keep the existing
+left-hand cast. Otherwise use the symmetry of the kind proof to
+cast the right index. The endpoint opposite the cast stays a
+canonical left-hand side for the solver. See (EIK3) in Note
+[Equalities with heterogeneous kinds] in GHC.Tc.Solver.Equality.
+Pattern synonym inference composes the worker proof with the inverse
+transport. The resulting coercion can use the local kind proof, but its
+endpoints are the source EqSpec endpoints and can appear in a signature.
+
+Preserve source existential TyVars before the synthesized CoVars.
+A proof can mention a source existential, so the wrapper and the
+matcher instantiate source existentials first. Put the proof fields
+before the source context dictionaries and ordinary fields. The
+wrapper skips the remaining proof fields before applying unboxers to
+the dictionaries and fields. Pattern synonym inference restores the
+proof prefix and retains the source context evidence verbatim.
+The index kind can contain nested type-variable foralls, arrows, and
+type constructor applications. ForAllCo relates each binder kind with an
+earlier proof and uses that proof at occurrences of the binder in the
+body. See Note [ForAllCo] in GHC.Core.TyCo.Rep.
+The free variables of the index kind must be type variables. Each variable
+must have an earlier proof in scope or an expanded kind independent of
+those proofs.
+
+Keep the source EqSpecs for the source constructor signature and
+pattern-match oracle. The interface records the worker binders in
+ifConExTCvs. They must have the predicates of the supported prefix in
+order. The reader uses the EqSpecs to reconstruct the same index proof
+fields. HEq# has its own wired-in telescope and has no EqSpecs.
+See 'GHC.Settings.Constants.hiVersion' for the interface gate.
+-}
+
 instance Outputable EqSpec where
   ppr (EqSpec tv ty) = ppr (tv, ty)
 
@@ -1113,7 +1321,73 @@ mkDataCon :: Name
           -> DataCon
   -- Can get the tag from the TyCon
 
-mkDataCon name declared_infix prom_info
+mkDataCon = mkDataConWithRetainedArgs []
+
+-- | Build a constructor with its existing retained-field layout.
+mkDataConWithRetainedArgs :: [Maybe Id] -- ^ Retained binders, aligned with original fields
+          -> Name
+          -> Bool               -- ^ Is the constructor declared infix?
+          -> TyConRepName       -- ^  TyConRepName for the promoted TyCon
+          -> [HsSrcBang]        -- ^ Strictness/unpack annotations, from user
+          -> [HsImplBang]       -- ^ Strictness/unpack annotations, as inferred by the compiler
+          -> [StrictnessMark]   -- ^ Strictness marks for the DataCon worker's fields in Core
+          -> [FieldLabel]       -- ^ Field labels for the constructor,
+                                -- if it is a record, otherwise empty
+          -> [TyVar]            -- ^ Universals.
+          -> [TyCoVar]          -- ^ Existentials.
+          -> ConcreteTyVars
+                                -- ^ TyVars which must be instantiated with
+                                -- concrete types
+          -> [TyVarBinder]      -- ^ User-written 'TyVarBinder's
+          -> [EqSpec]           -- ^ GADT equalities
+          -> KnotTied ThetaType -- ^ Theta-type occurring before the arguments proper
+          -> [KnotTied (Scaled Type)]    -- ^ Original argument types
+          -> KnotTied Type      -- ^ Original result type
+          -> PromDataConInfo    -- ^ See comments on 'GHC.Core.TyCon.PromDataConInfo'
+          -> KnotTied TyCon     -- ^ Representation type constructor
+          -> ConTag             -- ^ Constructor tag
+          -> ThetaType          -- ^ The "stupid theta", context of the data
+                                -- declaration e.g. @data Eq a => T a ...@
+          -> Id                 -- ^ Worker Id
+          -> DataConRep         -- ^ Representation
+          -> DataCon
+  -- Can get the tag from the TyCon
+
+mkDataConWithRetainedArgs = mkDataConWithTelescope (LegacyConOrder 0)
+
+-- | Build a constructor with an ordered source telescope.
+-- See Notes [Terminal constructor type arguments] and [Retained constructor field telescopes].
+mkDataConWithTelescope :: ConSourceOrder -- ^ Constructor argument order
+          -> [Maybe Id]               -- ^ Retained binders, aligned with original fields
+          -> Name
+          -> Bool               -- ^ Is the constructor declared infix?
+          -> TyConRepName       -- ^  TyConRepName for the promoted TyCon
+          -> [HsSrcBang]        -- ^ Strictness/unpack annotations, from user
+          -> [HsImplBang]       -- ^ Strictness/unpack annotations, as inferred by the compiler
+          -> [StrictnessMark]   -- ^ Strictness marks for the DataCon worker's fields in Core
+          -> [FieldLabel]       -- ^ Field labels for the constructor,
+                                -- if it is a record, otherwise empty
+          -> [TyVar]            -- ^ Universals.
+          -> [TyCoVar]          -- ^ Existentials.
+          -> ConcreteTyVars
+                                -- ^ TyVars which must be instantiated with
+                                -- concrete types
+          -> [TyVarBinder]      -- ^ User-written 'TyVarBinder's
+          -> [EqSpec]           -- ^ GADT equalities
+          -> KnotTied ThetaType -- ^ Theta-type occurring before the arguments proper
+          -> [KnotTied (Scaled Type)]    -- ^ Original argument types
+          -> KnotTied Type      -- ^ Original result type
+          -> PromDataConInfo    -- ^ See comments on 'GHC.Core.TyCon.PromDataConInfo'
+          -> KnotTied TyCon     -- ^ Representation type constructor
+          -> ConTag             -- ^ Constructor tag
+          -> ThetaType          -- ^ The "stupid theta", context of the data
+                                -- declaration e.g. @data Eq a => T a ...@
+          -> Id                 -- ^ Worker Id
+          -> DataConRep         -- ^ Representation
+          -> DataCon
+  -- Can get the tag from the TyCon
+
+mkDataConWithTelescope source_order arg_binders name declared_infix prom_info
           arg_stricts  -- Must match orig_arg_tys 1-1
           impl_bangs   -- Must match orig_arg_tys 1-1
           str_marks    -- Must be empty or match dataConRepArgTys 1-1
@@ -1132,9 +1406,110 @@ mkDataCon name declared_infix prom_info
 
   = con
   where
+    valid_retained_args
+      = arg_binders `equalLength` orig_arg_tys
+        && all isTyVar ex_tvs && validRetainedConTheta theta && null stupid_theta
+        && (case source_order of
+              LegacyConOrder 0 -> null eq_spec || (null ex_tvs && null theta)
+              _ -> False)
+        && valid_record && isVanillaAlgTyCon rep_tycon
+        && not (isTypeDataTyCon rep_tycon)
+        && isLiftedTypeKind (tyConResKind rep_tycon)
+        && all lazy_src arg_stricts
+        && all lazy_impl impl_bangs && not (any isMarkedStrict str_marks)
+        && valid_fields emptyVarSet arg_binders orig_arg_tys
+        && valid_result
+
+    valid_record
+      | null fields = True
+      | Just _ : rest@(_ : _) <- arg_binders
+      = all isNothing rest && fields `equalLength` orig_arg_tys
+        && all (\tv -> varType tv `eqType` liftedTypeKind) univ_tvs
+        && map binderVar user_tvbs == univ_tvs && null ex_tvs && null eq_spec && null theta
+      | otherwise = False
+
+    valid_result
+      | null eq_spec
+      = not (anyFreeVarsOfType isId orig_res_ty)
+        && valid_universals
+        && case rep of { NoDataConRep -> True; _ -> False }
+      | Just (parent, args) <- splitTyConApp_maybe orig_res_ty
+      = parent == rep_tycon
+        && validRetainedResultEqSpec univ_tvs [b | Just b <- arg_binders] eq_spec
+        && eqTypes args (substTyCoVars result_subst univ_tvs)
+        && valid_universals
+        && all (not . anyFreeVarsOfType isId . scaledMult) orig_arg_tys
+        && case rep of { DCR {} -> True; _ -> False }
+      | otherwise = False
+      where
+        result_subst = mkTvSubstPrs (map eqSpecPair eq_spec)
+
+    valid_universals
+      = ((null theta && null ex_tvs) || (null eq_spec && user_tvs == univ_tvs ++ ex_tvs))
+        && all isTyVar univ_tvs && all isTyVar ex_tvs && all isTyVar user_tvs
+        && sizeVarSet univ_set == length univ_tvs
+        && sizeVarSet ex_set == length ex_tvs
+        && disjointVarSet univ_set ex_set
+        && sizeVarSet (mkVarSet user_tvs) == length user_tvs
+        && checkDataConTyVars con
+      where
+        user_tvs = binderVars user_tvbs
+        univ_set = mkVarSet univ_tvs
+        ex_set   = mkVarSet ex_tvs
+
+    lazy_src (HsSrcBang _ unpack strict)
+      = not (isSrcUnpacked unpack) && not (isSrcStrict strict)
+    lazy_impl HsLazy = True
+    lazy_impl _      = False
+
+    valid_fields _ [] [] = True
+    valid_fields scope (mb : bs) (Scaled mult ty : tys)
+      = isLiftedTypeKind (typeKind ty)
+        && not (anyFreeVarsOfType (\v -> isId v && not (v `elemVarSet` scope)) ty)
+        && case mb of
+             Nothing -> valid_fields scope bs tys
+             Just b  -> isNativeRetainedField b && isManyTy mult
+                        && valid_indexed_field ty
+                        && varType b `eqType` ty
+                        && not (b `elemVarSet` mkVarSet (univ_tvs ++ ex_tvs))
+                        && not (b `elemVarSet` scope)
+                        && valid_fields (extendVarSet scope b) bs tys
+    valid_fields _ _ _ = False
+
+    valid_indexed_field ty
+      | isNativeIndexType ty || isTyVarTy ty = True
+      | isNativeIndexedFieldDomain ty
+      , TyConApp tc _ <- coreFullView ty
+      = all (valid_indexed_con tc) (tyConDataCons tc)
+      | otherwise = True
+
+    valid_indexed_con tc dc
+      | (_, exs, specs, [], fields, _) <- dataConFullSig dc
+      , all isTyVar exs
+      , null (dataConStupidTheta dc)
+      , dataConRepArity dc == length specs + length fields
+      , all (not . isBanged) (dataConImplBangs dc)
+      = case specs of
+          [] -> not (null exs)
+                || any (\c -> not (null (dcEqSpec c)) || not (null (dataConExTyCoVars c)))
+                       (tyConDataCons tc)
+                || (all (\c -> isVanillaDataCon c && null (dataConRepArgBinders c)
+                               && isNothing (dataConWrapId_maybe c)) (tyConDataCons tc)
+                    && not (isNativeIndexType (mkTyConApp tc (mkTyVarTys (tyConTyVars tc)))))
+          [spec] -> not (null fields) || not (null exs) || noFreeVarsOfType (eqSpecType spec)
+                    || is_diagonal dc spec
+          _ -> False
+      | otherwise = False
+
+    is_diagonal dc spec
+      | (univs, [], [_], [], [], _) <- dataConFullSig dc
+      , Just rhs <- getTyVar_maybe (eqSpecType spec)
+      = rhs /= eqSpecTyVar spec && rhs `elem` univs
+      | otherwise = False
+
     is_vanilla = null ex_tvs && null eq_spec && null theta
     str_marks' | not $ any isMarkedStrict str_marks = []
-               | otherwise                          = str_marks
+               | otherwise = replicate (count isCoVar ex_tvs) NotMarkedStrict ++ str_marks
 
     con = MkData {dcName = name, dcUnique = nameUnique name,
                   dcVanilla = is_vanilla, dcInfix = declared_infix,
@@ -1142,9 +1517,11 @@ mkDataCon name declared_infix prom_info
                   dcExTyCoVars = ex_tvs,
                   dcConcreteTyVars = conc_tvs,
                   dcUserTyVarBinders = user_tvbs,
+                  dcSourceOrder = source_order,
                   dcEqSpec = eq_spec,
                   dcOtherTheta = theta,
                   dcStupidTheta = stupid_theta,
+                  dcOrigArgBinders = arg_binders,
                   dcOrigArgTys = orig_arg_tys, dcOrigResTy = orig_res_ty,
                   dcRepTyCon = rep_tycon,
                   dcSrcBangs = arg_stricts, dcImplBangs = impl_bangs,
@@ -1162,19 +1539,30 @@ mkDataCon name declared_infix prom_info
 
     rep_arg_tys = dataConRepArgTys con
 
-    rep_ty =
-      case rep of
-        -- If the DataCon has no wrapper, then the worker's type *is* the
-        -- user-facing type, so we can simply use dataConWrapperType.
-        NoDataConRep -> dataConWrapperType con
-        -- If the DataCon has a wrapper, then the worker's type is never seen
-        -- by the user. The visibilities we pick do not matter here.
-        DCR{} -> mkInfForAllTys univ_tvs $ mkTyCoInvForAllTys ex_tvs $
-                 mkScaledFunctionTys rep_arg_tys $
-                 mkTyConApp rep_tycon (mkTyVarTys univ_tvs)
-                 -- res_arg_tys is a mixture of TypeLike and ConstraintLike,
-                 -- so we don't know which FunTyFlag to use
-                 -- Hence using mkScaledFunctionTys.
+    rep_ty
+      | not (null arg_binders), not valid_retained_args
+      = pprPanic "mkDataConWithTelescope: invalid retained telescope" (ppr name)
+      | dataConHasRetainedResult con
+      = mkInfForAllTys [(unmatchableDataConTy, tv) | tv <- univ_tvs] $
+        mkRetainedArgTys arg_binders orig_arg_tys $
+        mkScaledFunctionTysU (map unrestricted (eqSpecPreds eq_spec)) $
+        mkTyConApp rep_tycon (mkTyVarTys univ_tvs)
+      | NoDataConRep <- rep, not (name `hasKey` heqDataConKey)
+      = dataConWrapperTypeUnchecked con
+        -- With no wrapper, the worker usually has the user-facing type.
+      | not (null arg_binders)
+      = mkInfForAllTys [(unmatchableDataConTy, tv) | tv <- univ_tvs] $
+        mkTyCoInvForAllTys [(unmatchableDataConTy, tv) | tv <- ex_tvs] $
+        mkInvisFunTys theta $
+        mkRetainedArgTys arg_binders orig_arg_tys $
+        mkTyConApp rep_tycon (mkTyVarTys univ_tvs)
+      | otherwise
+      = mkInfForAllTys [(unmatchableDataConTy, tv) | tv <- univ_tvs] $
+        mkTyCoInvForAllTys [(unmatchableDataConTy, tv) | tv <- ex_tvs] $
+        mkScaledFunctionTysU rep_arg_tys $
+        mkTyConApp rep_tycon (mkTyVarTys univ_tvs)
+        -- HEq# uses the worker telescope without a wrapper.
+        -- See Note [The HEq# evidence telescope] in GHC.Builtin.WiredIn.Types.
 
       -- See Note [Promoted data constructors] in GHC.Core.TyCon
     prom_tv_bndrs = [ mkNamedTyConBinder vis tv
@@ -1186,14 +1574,122 @@ mkDataCon name declared_infix prom_info
       -- Tiresome!  And unnecessary because these tyvars are never looked at
     prom_arg_bndrs   = [ mkAnonTyConBinder (mkTyVar n t)
      {- Visible -}     | (n,t) <- dropList theta fresh_names `zip` map scaledThing orig_arg_tys ]
-    prom_bndrs       = prom_tv_bndrs ++ prom_arg_bndrs
+    late_tyvar_count = legacyConOrder source_order
+    (early_prom_bndrs, late_prom_bndrs)
+      | late_tyvar_count <= 0 = (prom_tv_bndrs, [])
+      | otherwise = splitAt (length prom_tv_bndrs - late_tyvar_count) prom_tv_bndrs
+    prom_bndrs
+      | OrderedConArgs groups <- source_order
+      = foldConSourceGroups (++) (const id) (++) groups prom_tv_bndrs theta prom_arg_bndrs []
+      | otherwise = early_prom_bndrs ++ prom_arg_bndrs ++ late_prom_bndrs
     prom_res_kind    = orig_res_ty
-    promoted         = mkPromotedDataCon con name prom_info prom_bndrs
-                                         prom_res_kind roles rep_info
+    promoted
+      | null arg_binders
+      = mkPromotedDataCon con name prom_info prom_bndrs
+                         prom_res_kind (roles Representational) rep_info
+      | Just (witness, payloads) <- promotedRetainedFields con
+      , witness_name : payload_names <- fresh_names
+      = let index = mkTyVar witness_name (varType witness)
+            payload_binder n payload = mkAnonTyConBinder (mkTyVar n (payload (mkTyVarTy index)))
+            binders = prom_tv_bndrs ++
+                      (mkNamedTyConBinder Required index : zipWith payload_binder payload_names payloads)
+        in mkPromotedDataCon con name prom_info binders
+                             prom_res_kind (roles Nominal) rep_info
+      | otherwise
+      = pprPanic "promoteDataCon: retained field telescope" (ppr name)
 
-    roles = map (\tv -> if isTyVar tv then Nominal else Phantom)
-                (univ_tvs ++ ex_tvs)
-            ++ map (const Representational) (theta ++ map scaledThing orig_arg_tys)
+    roles field_role
+      | OrderedConArgs groups <- source_order
+      = foldConSourceGroups (\ts -> (replicate (length ts) Nominal ++)) (const id)
+          (\fs -> (replicate (length fs) field_role ++)) groups prom_tv_bndrs theta prom_arg_bndrs []
+      | late_tyvar_count > 0
+      = map (const Nominal) early_prom_bndrs
+        ++ map (const field_role) prom_arg_bndrs
+        ++ map (const Nominal) late_prom_bndrs
+      | otherwise
+      = map (\tv -> if isTyVar tv then Nominal else Phantom) (univ_tvs ++ ex_tvs)
+        ++ map (const field_role) (theta ++ map scaledThing orig_arg_tys)
+
+{- Note [Promoting one retained witness]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Keep the runtime witness as an Id in the worker and in patterns. The
+promoted constructor instead binds a fresh required type variable of
+the witness's domain. All the payload argument kinds use this variable.
+Ordinary kind application substitutes the first argument into each
+following argument kind.
+
+The source and interface readers use the same shape check. This
+subset admits one direct occurrence of the witness in the final
+argument of each payload type. The head can be a type constructor, as
+in `Vec a n`, or a universal parameter, as in `p n`. In the latter
+case, the domain of `p` must match the witness type and its result
+must be lifted. Other arguments and the result contain no runtime Ids.
+The supported payload multiplicities affect the
+runtime constructor only. Promotion does not supply any evidence
+that a runtime scrutinee equals this promoted constructor.
+-}
+
+-- | Can this retained constructor use a checked promoted telescope?
+-- See Note [Promoting one retained witness].
+dataConHasPromotedRetained :: DataCon -> Bool
+dataConHasPromotedRetained = isJust . promotedRetainedFields
+
+-- | Does the promoted constructor need the sibling-field interface feature?
+dataConHasPromotedRetainedSiblings :: DataCon -> Bool
+dataConHasPromotedRetainedSiblings con =
+    dataConSourceArity con > 2 && dataConHasPromotedRetained con
+
+-- | Keep the runtime Id separate from the required binder in the promoted kind.
+-- Each ordinary payload has the same witness as its final index argument.
+promotedRetainedFields :: DataCon -> Maybe (Id, [Type -> Type])
+promotedRetainedFields con
+  | Just witness : binders <- dataConRepArgBinders con
+  , (univs, [], [], [], Scaled witness_mult witness_ty : fields@(_ : _), result) <- dataConFullSig con
+  , all isNothing binders
+  , map binderVar (dataConUserTyVarBinders con) == univs
+  , isManyTy witness_mult
+  , isNativeClosedIndexType witness_ty
+    || maybe False (`elem` univs) (getTyVar_maybe witness_ty)
+  , witness_ty `eqType` varType witness
+  , not (anyFreeVarsOfType isId result)
+  , Just payloads <- traverse (promotedRetainedPayload univs witness) fields
+  = Just (witness, payloads)
+  | otherwise = Nothing
+
+-- | Check that the record has a closed or quantified first witness and promoted payloads.
+-- See Note [Retained constructor field telescopes].
+validRetainedRecordFields :: [Maybe Id] -> [Scaled Type] -> Bool
+validRetainedRecordFields (Just witness : binders) (_ : fields@(_ : _)) =
+  let fam_tvs = [tv | Scaled _ (AppTy (TyVarTy tv) _) <- fields]
+  in all isNothing binders
+     && (isNativeClosedIndexType (varType witness) || isJust (getTyVar_maybe (varType witness)))
+     && any (anyFreeVarsOfType (== witness) . scaledThing) fields
+     && all (isJust . promotedRetainedPayload fam_tvs witness) fields
+validRetainedRecordFields _ _ = False
+
+-- | Abstract the final witness argument of one checked payload type.
+promotedRetainedPayload :: [TyVar] -> Id -> Scaled Type -> Maybe (Type -> Type)
+promotedRetainedPayload univs witness (Scaled mult body)
+  | isOneTy mult || isManyTy mult = abstract_payload body
+  | otherwise = Nothing
+  where
+    abstract_payload (AppTy head_ty@(TyVarTy family) (TermVarTy v))
+      | family `elem` univs
+      , witness == v
+      , Just (_, _, _, domain, range) <- splitFunTy_maybe (tyVarKind family)
+      , domain `eqType` varType witness
+      , range `eqType` liftedTypeKind
+      = Just (mkAppTy head_ty)
+    abstract_payload ty
+      | Just (head_tc, args) <- splitTyConAppNoView_maybe ty
+      , TermVarTy v : reverse_prefix <- reverse args
+      , witness == v
+      , let prefix = reverse reverse_prefix
+      , all (not . anyFreeVarsOfType isId) prefix
+      = Just (\index -> mkTyConApp head_tc (prefix ++ [index]))
+      | not (anyFreeVarsOfType isId ty)
+      = Just (const ty)
+      | otherwise = Nothing
 
 freshNames :: [Name] -> [Name]
 -- Make an infinite list of Names whose Uniques and OccNames
@@ -1280,10 +1776,77 @@ dataConUserTyVars (MkData { dcUserTyVarBinders = tvbs }) = binderVars tvbs
 dataConUserTyVarBinders :: DataCon -> [TyVarBinder]
 dataConUserTyVarBinders = dcUserTyVarBinders
 
+-- | Source order attached to the constructor's existing argument arrays.
+-- See Note [Interior constructor telescopes].
+dataConSourceOrder :: DataCon -> ConSourceOrder
+dataConSourceOrder = dcSourceOrder
+
+-- | The historical terminal order.
+dataConTerminalOrder :: DataCon -> Int
+dataConTerminalOrder = legacyConOrder . dataConSourceOrder
+
+-- | Number of fields checked before an interior context.
+dataConInteriorContext :: DataCon -> Maybe Int
+dataConInteriorContext = conInteriorContext . dataConSourceOrder
+
+-- | Position of a written context after at least one field.
+dataConContextFieldCount :: DataCon -> Maybe Int
+dataConContextFieldCount con
+  | dataConHasTrailingContext con = Just (dataConSourceArity con)
+  | otherwise = dataConInteriorContext con
+
+-- | The field and binder counts for the interior forall groups.
+dataConInteriorForAll :: DataCon -> Maybe [(Int, Int)]
+dataConInteriorForAll con
+  | OrderedConArgs groups <- dataConSourceOrder con
+  , type_groups@(_ : _) <- orderedConTypeGroups groups
+  = Just type_groups
+  | otherwise = Nothing
+
+-- | Check each argument against the binders still to come.
+-- See Note [Interior constructor telescopes].
+orderedConArgsHaveScope :: [ConSourceGroup] -> [TyVarBinder] -> ThetaType -> [Scaled Type] -> Bool
+orderedConArgsHaveScope groups binders theta fields =
+  snd (foldConSourceGroups add_binders check_context check_fields
+         groups binders theta fields (emptyVarSet, True))
+  where
+    add_binders bs (late, valid) =
+      (extendVarSetList late (binderVars bs),
+       valid && disjointVarSet late (tyCoVarsOfTypes (map (varType . binderVar) bs)))
+    check_context theta (late, valid) =
+      (late, valid && disjointVarSet late (tyCoVarsOfTypes theta))
+    check_fields fs = check_context (concatMap (\(Scaled m ty) -> [m, ty]) fs)
+
+-- | Number of type arguments after the initial value fields.
+dataConLateTyVarCount :: DataCon -> Int
+dataConLateTyVarCount con = case dataConInteriorForAll con of
+  Just groups -> sum (map snd groups)
+  Nothing -> max 0 (dataConTerminalOrder con)
+
+-- | Does the context follow the fields and any late type binders?
+-- See Note [Terminal constructor type arguments].
+dataConHasTrailingContext :: DataCon -> Bool
+dataConHasTrailingContext con
+  | dataConTerminalOrder con == gadtTrailingContextOnly = True
+  | dataConTerminalOrder con > 0
+  , (_, Bndr _ vis : _) <- dataConUserTyVarGroups con = isSpecifiedForAllTyFlag vis
+  | otherwise = False
+
+-- | The type binders before and after the initial value fields.
+dataConUserTyVarGroups :: DataCon -> ([TyVarBinder], [TyVarBinder])
+dataConUserTyVarGroups con
+  | late == 0 = (binders, [])
+  | otherwise = splitAt (length binders - late) binders
+  where
+    binders = dataConUserTyVarBinders con
+    late = dataConLateTyVarCount con
+
 -- | Dependent (kind-level) equalities in a constructor.
 -- There are extracted from the existential variables.
 -- See Note [Existential coercion variables]
 dataConKindEqSpec :: DataCon -> [EqSpec]
+dataConKindEqSpec con
+  | Just _ <- dataConGadtProof_maybe con = []
 dataConKindEqSpec (MkData {dcExTyCoVars = ex_tcvs})
   -- It is used in 'dataConEqSpec' (maybe also 'dataConFullSig' in the future),
   -- which are frequently used functions.
@@ -1370,10 +1933,13 @@ dataConSourceArity (MkData { dcSourceArity = arity }) = arity
 
 -- | Number of visible arguments of the data constructor
 dataConVisArity :: DataCon -> VisArity
-dataConVisArity (MkData { dcUserTyVarBinders = tvbs, dcSourceArity = arity })
+dataConVisArity (MkData { dcUserTyVarBinders = tvbs
+                        , dcOrigArgBinders = arg_binders
+                        , dcSourceArity = arity })
   = n_of_required_ty_args + n_of_val_args
   where
-    n_of_val_args         = arity
+    n_of_invis_retained   = count (maybe False (invisibleRetainedIdInfo . idInfo)) arg_binders
+    n_of_val_args         = arity - n_of_invis_retained
     n_of_required_ty_args = count isVisibleForAllTyBinder tvbs
 
 -- | Gives the number of value arguments (including zero-width coercions)
@@ -1406,8 +1972,8 @@ isLazyDataConRep dc = null (dcStricts dc)
 dataConRepStrictness :: DataCon -> [StrictnessMark]
 -- ^ Give the demands on the runtime arguments of a Core DataCon worker
 -- application.
--- The length of the list matches `dataConRepArgTys` (e.g., the number
--- of runtime arguments).
+-- There is one mark per worker argument, including each existential
+-- coercion binder.
 dataConRepStrictness dc
   | isLazyDataConRep dc
   = replicate (dataConRepArity dc) NotMarkedStrict
@@ -1434,13 +2000,18 @@ dataConInstSig
 --     , instantiated constraints including dependent GADT equalities
 --         which are *also* listed in the instantiated existentials
 --     , instantiated args)
-dataConInstSig con@(MkData { dcUnivTyVars = univ_tvs, dcExTyCoVars = ex_tvs
+dataConInstSig con@(MkData { dcUnivTyVars = univ_tvs
                            , dcOrigArgTys = arg_tys })
                univ_tys
+  | not (null (dataConRepArgBinders con))
+  = pprPanic "dataConInstSig: retained constructor field telescope" (ppr con)
+    -- See Note [Retained constructor field telescopes].
+  | otherwise
   = ( ex_tvs'
     , substTheta subst (dataConTheta con)
     , substTys subst (map scaledThing arg_tys))
   where
+    (_, ex_tvs, _, _, _, _) = dataConFullSig con
     univ_subst = zipTvSubst univ_tvs univ_tys
     (subst, ex_tvs') = Type.substVarBndrs univ_subst ex_tvs
 
@@ -1449,7 +2020,7 @@ dataConInstSig con@(MkData { dcUnivTyVars = univ_tvs, dcExTyCoVars = ex_tvs
 --
 -- 1) The result of 'dataConUnivTyVars'
 --
--- 2) The result of 'dataConExTyCoVars'
+-- 2) The source existential variables. See Note [Kind evidence in GADT workers].
 --
 -- 3) The non-dependent GADT equalities.
 --    Dependent GADT equalities are implied by coercion variables in
@@ -1465,10 +2036,13 @@ dataConInstSig con@(MkData { dcUnivTyVars = univ_tvs, dcExTyCoVars = ex_tvs
 -- 6) The original result type of the 'DataCon'
 dataConFullSig :: DataCon
                -> ([TyVar], [TyCoVar], [EqSpec], ThetaType, [Scaled Type], Type)
-dataConFullSig (MkData {dcUnivTyVars = univ_tvs, dcExTyCoVars = ex_tvs,
+dataConFullSig con@(MkData {dcUnivTyVars = univ_tvs, dcExTyCoVars = ex_tvs,
                         dcEqSpec = eq_spec, dcOtherTheta = theta,
                         dcOrigArgTys = arg_tys, dcOrigResTy = res_ty})
-  = (univ_tvs, ex_tvs, eq_spec, theta, arg_tys, res_ty)
+  = (univ_tvs, source_exs, eq_spec, theta, arg_tys, res_ty)
+  where
+    source_exs | Just (source_tvs, _, _, _) <- dataConGadtFields_maybe con = source_tvs
+               | otherwise = ex_tvs
 
 dataConOrigResTy :: DataCon -> Type
 dataConOrigResTy dc = dcOrigResTy dc
@@ -1513,14 +2087,303 @@ dataConWrapperType :: DataCon -> Type
 --
 -- NB: If the constructor is part of a data instance, the result type
 -- mentions the family tycon, not the internal one.
-dataConWrapperType (MkData { dcUserTyVarBinders = user_tvbs,
-                             dcOtherTheta = theta, dcOrigArgTys = arg_tys,
-                             dcOrigResTy = res_ty,
-                             dcStupidTheta = stupid_theta })
-  = mkForAllTys user_tvbs $
-    mkInvisFunTys (stupid_theta ++ theta) $
-    mkScaledFunTys arg_tys $
-    res_ty
+dataConWrapperType con
+  | con `hasKey` heqDataConKey
+  = dataConRepType con
+  | not (null (dataConRepArgBinders con))
+  = dataConRepType con `seq` dataConWrapperTypeUnchecked con
+  | otherwise
+  = dataConWrapperTypeUnchecked con
+
+-- | Rebuild the user type after the retained representation check.
+dataConWrapperTypeUnchecked :: DataCon -> Type
+dataConWrapperTypeUnchecked con@(MkData { dcOtherTheta = theta, dcOrigArgTys = arg_tys,
+                                 dcOrigArgBinders = arg_binders,
+                                 dcOrigResTy = res_ty,
+                                 dcStupidTheta = stupid_theta })
+  | OrderedConArgs groups <- dataConSourceOrder con
+  = mkInvisFunTys stupid_theta $
+    foldConSourceGroups bind_types mkInvisFunTys (mkRetainedArgTys [])
+      groups (dataConUserTyVarBinders con) theta arg_tys res_ty
+  | otherwise
+  = mkForAllTys [(unmatchableDataConTy, bndr) | bndr <- early] $
+    mkInvisFunTys (stupid_theta ++ early_theta) $
+    mkRetainedArgTys arg_binders arg_tys $
+    mkForAllTys [(unmatchableDataConTy, bndr) | bndr <- late] $
+    mkInvisFunTys late_theta res_ty
+  where
+    (early, late) = dataConUserTyVarGroups con
+    bind_types bs = mkForAllTys [(unmatchableDataConTy, b) | b <- bs]
+    (early_theta, late_theta)
+      | dataConHasTrailingContext con = ([], theta)
+      | otherwise = (theta, [])
+
+{- Note [Terminal constructor type arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The source type can put a required or specified type group after its fields.
+Keep its position in the wrapper and in pattern checking. The worker still
+binds all type variables and evidence before its representation fields.
+
+The supported terminal groups are distinct. A required group can have a
+context before the fields. A specified group has its context after its
+binders and has no context before the fields. A context alone can also
+follow the fields. It uses the context-only marker in the terminal order
+field. The wrapper and pattern operations use the decoded binder count
+and context position. A pattern receives the Givens from a trailing context after its earlier
+field and type patterns. The wrapper takes each dictionary in the same
+place as its source constraint. The promoted constructor follows source
+argument order when it has a promotable context.
+Its term wrapper disqualifies it from structural native index domains.
+See Note [Algebraic runtime index domains] in GHC.Core.Type.
+-}
+
+{- Note [Interior constructor telescopes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A prefix GADT constructor can have contexts and specified forall
+groups between fields.
+
+  Two  :: forall a. Tag a -> (a ~ Int) => Tag a -> Two a
+  Pack :: Int -> forall a. a -> Pack
+  Parcel :: Int -> forall a. a -> forall a. a -> Parcel
+  Stored :: Int -> forall a. Eq a => a -> Stored a
+
+Store the source order in groups of type binders, fields and predicates.
+Each group consumes its entries from the existing DataCon arrays. The
+wrapper takes its arguments in this order. Its demand signature uses
+the same order. The worker still takes its type arguments and evidence
+before its representation fields.
+
+Pattern checking introduces each context after its preceding fields.
+The following fields can use its evidence. Zonking and desugaring
+bind the solved evidence at that boundary. See Note [Trailing
+constructor evidence] in GHC.HsToCore.Match.Constructor.
+
+The kind or type of an earlier argument must be independent of a later
+type binder. For an interior forall, pattern checking allocates the
+existential skolems in the constructor case. A written type pattern
+introduces its source binders after the preceding field patterns. Their
+Givens are available at that type pattern. The two binders in Parcel
+have different Names. The scope check walks the same groups from right
+to left to find the binders that are unavailable at each argument.
+Check a context against exactly those binders that follow it. See
+GHC.Tc.Gen.Pat.tcDataConPatWithIndex.
+
+Ordinary and terminal forms still use LegacyConOrder. Their interface
+tags and payloads are the same. An interface with an interior group
+stores the full group order for that constructor and checks it against
+its decoded arrays. See GHC.IfaceToCore.tcIfaceDataCons.
+-}
+
+-- | Return retained binders for the source fields. An empty list denotes
+-- ordinary fields. Dictionaries precede these fields. A retained result
+-- adds its equalities after these fields.
+dataConRepArgBinders :: DataCon -> [Maybe Id]
+dataConRepArgBinders = dcOrigArgBinders
+
+-- | A constructor whose result indices refer to its retained fields.
+-- See Note [Retained constructor result equality].
+dataConHasRetainedResult :: DataCon -> Bool
+dataConHasRetainedResult con
+  = not (null (dcOrigArgBinders con)) && not (null (dcEqSpec con))
+
+-- | Find the retained fields in a supported result argument.
+-- See Note [Retained constructor result equality].
+retainedResultFields_maybe :: Type -> Maybe [Id]
+retainedResultFields_maybe (TermVarTy field) = Just [field]
+retainedResultFields_maybe (TyConApp tc args)
+  | isPromotedDataCon tc
+  , Just fields <- concat <$> traverse field_arg args
+  , not (null fields)
+  = Just fields
+  where
+    field_arg (TermVarTy field) = Just [field]
+    field_arg ty
+      | not (anyFreeVarsOfType isId ty) = Just []
+      | otherwise = Nothing
+retainedResultFields_maybe _ = Nothing
+
+-- | Check each argument against the instantiated promoted telescope.
+-- See Note [Retained constructor result equality].
+validRetainedResultKind :: Type -> Bool
+validRetainedResultKind (TermVarTy _) = True
+validRetainedResultKind (TyConApp tc args)
+  | isPromotedDataCon tc = check_args (tyConKind tc) args
+  where
+    check_args kind [] = isNativeClosedIndexType kind || isNativeIndexedFieldDomain kind
+    check_args kind (arg : rest)
+      | Just (_, binder, result) <- splitPiTy_maybe kind
+      = case (binder, arg) of
+          (Named (Bndr tv vis), _)
+            | isTyVar tv, isInvisibleForAllTyFlag vis
+            , not (anyFreeVarsOfType (\v -> isId v || isCoVar v) arg)
+            , isTauTy arg, not (hasCoercionHole arg)
+            , varType tv `eqType` typeKind arg
+            -> check_args (piResultTy kind arg) rest
+          (Anon (Scaled _ domain) FTF_T_T, TermVarTy field)
+            -> domain `eqType` varType field && check_args result rest
+          _ -> False
+      | otherwise = False
+validRetainedResultKind _ = False
+
+-- | Check that the result uses all retained fields and each refined universal once.
+-- See Note [Retained constructor result equality].
+validRetainedResultEqSpec :: [TyVar] -> [Id] -> [EqSpec] -> Bool
+validRetainedResultEqSpec univs fields eq_spec
+  = pairs `equalLength` eq_spec
+    && sizeVarSet (mkVarSet result_tvs) == length pairs
+    && all (`elemVarSet` universal_set) result_tvs
+    && sizeVarSet result_fields == length fields
+    && result_fields `subVarSet` mkVarSet fields
+  where
+    pairs = [(tv, retained) | EqSpec tv result <- eq_spec
+                            , Just retained <- [retainedResultFields_maybe result]
+                            , validRetainedResultKind result
+                            , varType tv `eqType` typeKind result]
+    result_tvs = map fst pairs
+    result_fields = mkVarSet (concatMap snd pairs)
+    universal_set = mkVarSet univs
+
+{- Note [Retained constructor result equality]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A constructor with this source type:
+
+  SomeVec :: foreach (n :: Nat) -> Vec a n -> SomeVec a n
+
+has a worker with a uniform result:
+
+  SomeVec :: forall a i. foreach (n :: Nat) -> Vec a n %1 -> (i ~# n) -> SomeVec a i
+
+The data constructor's EqSpec records i ~# n. The worker places that
+coercion argument after the source fields, in the scope of the retained
+field. The wrapper applies the worker at a and n. It passes the fields
+in source order and supplies reflexivity. A case alternative binds the
+fields, then the coercion at the fresh retained field Id. The coercion
+has no runtime representation. Building the constructor or binding its
+fields leaves the fields unevaluated.
+
+Do not put this proof in the ordinary EqSpec prefix. The source field Id
+would be out of scope there. Keep the same order when copying alternative
+binders in GHC.Core.Utils and when checking them in GHC.Core.Lint. An
+interface decodes the proof's type in the scope of the decoded field.
+
+Each retained field has a closed structural index type. It occurs as a
+result argument or as a direct visible argument of one promoted
+constructor. The application may carry closed erased types for the
+invisible type binders. For example, 'Just @Bool flag determines Bool
+before checking the stored flag against the instantiated field kind.
+The saturated application must have a closed structural result kind.
+This kind can differ from every field kind.
+For Tile, the EqSpec records shape ~# 'Rectangle rows columns.
+GHC's nominal equality solver can recover both dimensions from that
+one equality. Kind inference checks only the shape of the application.
+If it has unsolved kind casts, report any kind errors first. The full
+check uses the promoted telescope after the constructor knot is
+available.
+See Note [Decomposing TyConApp equalities] in
+GHC.Tc.Solver.Equality. The other arguments are unchanged universal
+variables. There are no contexts or existentials. The wrapper binds the
+unchanged variables. An ordinary field type can refer to earlier retained
+fields. Its multiplicity must be independent of the retained fields.
+
+The EqSpecs follow the result argument order. The fields follow the
+constructor telescope. For example, the telescope can bind columns before
+rows and return Matrix a rows columns. Validate the association by field Id.
+A square can use one field for two different result parameters. Its
+worker still binds that field once. Each EqSpec has a distinct universal
+on the left. All result equalities enter scope together after the fields.
+-}
+
+-- | Rebuild a constructor field telescope without erasing runtime binders.
+mkRetainedArgTys :: [Maybe Id] -> [Scaled Type] -> Type -> Type
+mkRetainedArgTys [] args res = mkScaledFunTysU args res
+mkRetainedArgTys (mb : bs) (arg : args) res
+  = case mb of
+      Nothing -> mkScaledFunTysU [arg] body
+      Just b  -> mkDepFunTyWithVis
+                   (if invisibleRetainedIdInfo (idInfo b) then DepFunInvisible else DepFunVisible)
+                   b body
+  where
+    body = mkRetainedArgTys bs args res
+mkRetainedArgTys _ _ _ = panic "mkRetainedArgTys: misaligned telescope"
+
+{- Note [Retained constructor field telescopes]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A retained field binds its actual runtime Id in the types of later fields.
+The original argument types alone cannot record this scope. Store a parallel
+list of optional binders. An empty list preserves the ordinary representation
+and its lazy construction. Validate only the new, nonempty representation.
+
+Keep the constructor and its metadata available before checking field domains.
+Validate the retained telescope when its worker or user type is demanded. An
+imported field domain can refer recursively to this TyCon. Domain validation
+must inspect the nonempty metadata and reject it without reentering the same
+field-type thunk. See Note [Retained constructor fields in interfaces] in
+GHC.Iface.Syntax. The ordinary constructor path keeps its existing laziness.
+
+The ordinary retained package has no wrapper. Its user quantifiers name
+the universal and existential type variables in order, with no duplicates.
+A retained result uses a wrapper and its own EqSpec, with no existential
+binders or class context. See Note [Retained constructor result equality].
+
+Neither form permits
+data families, newtypes, type data, strict fields, or unpacked fields.
+The parent and all fields are lifted. A named field has a checked
+domain and multiplicity Many. Its Id must be fresh. Only earlier retained
+fields can occur free in a field type. Rebuild the worker and wrapper types
+with DepFunTy (preserving DepFunVisible or DepFunInvisible) at each dependent
+field. Each runtime field remains an ordinary lazy constructor payload slot.
+See Note [Retained constructor equality contexts].
+
+A retained package can have record fields and ordinary lifted type
+parameters in datatype order. The labels must align with the arguments.
+The first field is the only retained binder. Every later field must use
+it as the final argument of its type.
+Check the payload types after the parent TyCon is available.
+See Note [Source retained constructor declarations] in GHC.Tc.TyCl.
+
+A function field has an ordinary Many arrow. Its endpoints are supported
+closed scalar domains or lifted erased type parameters. The actual field Id
+scopes the head of TermAppTy in later fields. Keep the function and its
+argument as separate runtime fields. No call equality
+implies function or argument equality. See Note [Function-valued retained
+binders] in GHC.Core.Type, GHC Proposal #378 (§4.9), and GHC Proposal #402.
+
+The promoted kind must bind each index used in a later field. See
+Note [Promoting one retained witness]. Reject other retained telescopes
+before requesting their promoted TyCon. Anonymous promoted binders would
+leave the original runtime Id out of scope.
+
+The flat instantiated-field APIs cannot return fresh runtime field binders.
+Reject retained constructors in dataConInstSig, dataConInstArgTys and
+dataConInstOrigArgTys. Use dataConRepInstPat for scoped Core patterns. Raw
+argument-type accessors must be used with dataConRepArgBinders.
+The product splitter declines retained constructors for the same reason.
+Constructor impossibility checking returns False without calling the flat
+signature API. The coverage checker must arrange its own field scope
+before it can use a retained result equality.
+
+Agda constructor telescopes scope earlier fields over later field types
+(Norell, 2007; Eisenberg, 2016, §5). This guides the binding representation,
+not the evaluation rules for lazy Haskell.
+
+Note [Retained constructor equality contexts]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An explicit class context (including boxed (~)) is a prefix of lazy dictionary
+fields in the worker. Each dictionary is an ordinary Id. Keep the constructor
+wrapper-free. Core case alternatives bind existential type variables and
+dictionaries before the source fields. Only the source fields have retained
+binder metadata.
+
+The context precedes every retained binder. Its scope contains only the
+constructor's universal and existential type variables. Require the user
+quantifiers to follow the universal-then-existential order so the constructor
+worker and its case alternatives instantiate the same dictionary types. Pattern
+checking supplies the prefix as local Givens. The coverage checker uses their
+predicates separately from the constructor's source fields.
+
+Neither promotion nor EqSpec refinement uses this representation. Both
+would need a separate rule for the retained field telescope.
+-}
 
 -- | Finds the instantiated types of the arguments required to construct a
 -- 'DataCon' representation
@@ -1534,6 +2397,9 @@ dataConInstArgTys :: DataCon    -- ^ A datacon with no existentials or equality 
                   -> [Scaled Type]
 dataConInstArgTys dc@(MkData {dcUnivTyVars = univ_tvs,
                               dcExTyCoVars = ex_tvs}) inst_tys
+ | not (null (dataConRepArgBinders dc))
+ = pprPanic "dataConInstArgTys: retained constructor field telescope" (ppr dc)
+ | otherwise
  = assertPpr (univ_tvs `equalLength` inst_tys)
              (text "dataConInstArgTys" <+> ppr dc $$ ppr univ_tvs $$ ppr inst_tys) $
    assertPpr (null ex_tvs) (ppr dc) $
@@ -1550,12 +2416,15 @@ dataConInstOrigArgTys
 -- But for the call in GHC.HsToCore.Match.Constructor, we really do want just
 -- the value args
 dataConInstOrigArgTys dc@(MkData {dcOrigArgTys = arg_tys,
-                                  dcUnivTyVars = univ_tvs,
-                                  dcExTyCoVars = ex_tvs}) inst_tys
+                                  dcUnivTyVars = univ_tvs}) inst_tys
+  | not (null (dataConRepArgBinders dc))
+  = pprPanic "dataConInstOrigArgTys: retained constructor field telescope" (ppr dc)
+  | otherwise
   = assertPpr (tyvars `equalLength` inst_tys)
               (text "dataConInstOrigArgTys" <+> ppr dc $$ ppr tyvars $$ ppr inst_tys) $
     substScaledTys subst arg_tys
   where
+    (_, ex_tvs, _, _, _, _) = dataConFullSig dc
     tyvars = univ_tvs ++ ex_tvs
     subst  = zipTCvSubst tyvars inst_tys
 
@@ -1620,6 +2489,11 @@ dataConOrigArgTys dc = dcOrigArgTys dc
 -- | Returns constraints in the wrapper type, other than those in the dataConEqSpec
 dataConOtherTheta :: DataCon -> ThetaType
 dataConOtherTheta dc = dcOtherTheta dc
+
+-- | The supported explicit context of a retained constructor.
+-- See Note [Retained constructor equality contexts].
+validRetainedConTheta :: ThetaType -> Bool
+validRetainedConTheta = all isClassPred
 
 -- | Returns the arg types of the worker, including *all* non-dependent
 -- evidence, after any flattening has been done and without substituting for
@@ -1786,6 +2660,9 @@ dataConCannotMatch :: [Type] -> DataCon -> Bool
 --                  scrutinee of type (T tys)
 --                  where T is the dcRepTyCon for the data con
 dataConCannotMatch tys con
+  | not (null (dataConRepArgBinders con))
+  = False -- Do not use the flat signature to instantiate a retained telescope.
+          -- See Note [Retained constructor field telescopes].
   -- See (U6) in Note [Implementing unsafeCoerce]
   -- in base:Unsafe.Coerce
   | con `hasKnownKey` unsafeReflDataConKey
@@ -1866,11 +2743,15 @@ dataConUserTyVarBindersNeedWrapper :: DataCon -> Bool
 dataConUserTyVarBindersNeedWrapper (MkData { dcUnivTyVars = univ_tvs
                                            , dcExTyCoVars = ex_tvs
                                            , dcUserTyVarBinders = user_tvbs
+                                           , dcSourceOrder = source_order
                                            , dcEqSpec = eq_spec })
   = assert (null eq_spec || answer)  -- all GADTs should say "yes" here
     answer
   where
-    answer = need_reorder || need_flag_cast
+    answer = noncanonical || need_reorder || need_flag_cast
+    noncanonical = case source_order of
+      LegacyConOrder n -> n /= 0
+      OrderedConArgs{} -> True
     need_reorder   = (univ_tvs ++ ex_tvs) /= binderVars user_tvbs
     need_flag_cast = any (not . isCoreTyLamForAllTyFlag)
                          (binderFlags user_tvbs)
@@ -1948,6 +2829,7 @@ splitDataProductType_maybe
 splitDataProductType_maybe ty
   | Just (tycon, ty_args) <- splitTyConApp_maybe ty
   , Just con <- tyConSingleDataCon_maybe tycon
+  , null (dataConRepArgBinders con) -- A flat result cannot preserve field scope.
   , null (dataConExTyCoVars con) -- no existentials! See above
   = Just (tycon, ty_args, con, dataConInstArgTys con ty_args)
   | otherwise

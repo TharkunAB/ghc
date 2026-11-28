@@ -15,13 +15,15 @@ import GHC.Prelude
 import GHC.Driver.Flags
 
 import GHC.Core
+import GHC.Core.Opt.OccurAnal (SimplCoreMode(..))
+import GHC.Core.TyCo.Rep (Type(DepDictTy, DepFunTy))
 import GHC.Core.Opt.Simplify.Monad
 import GHC.Core.Opt.ConstantFold
 import GHC.Core.Opt.Stats ( Tick(..) )
 import GHC.Core.Opt.Simplify.Env
 import GHC.Core.Opt.Simplify.Inline
 import GHC.Core.Opt.Simplify.Utils
-import GHC.Core.Opt.OccurAnal ( occurAnalyseExpr, zapLambdaBndrs )
+import GHC.Core.Opt.OccurAnal ( occurAnalyseExprWithMode, zapLambdaBndrs )
 import GHC.Core.Make hiding( wrapFloats )
 import qualified GHC.Core.Make
 import GHC.Core.Coercion hiding ( substCo, substCoVar )
@@ -40,8 +42,9 @@ import GHC.Core.Utils
 import GHC.Core.Opt.Arity ( ArityType, exprArity, arityTypeBotSigs_maybe
                           , pushCoTyArg, pushCoValArg, exprIsDeadEnd
                           , typeArity, arityTypeArity, etaExpandAT )
-import GHC.Core.SimpleOpt ( exprIsConApp_maybe, joinPointBinding_maybe, joinPointBindings_maybe )
-import GHC.Core.FVs     ( mkRuleInfo {- exprsFreeIds -} )
+import GHC.Core.SimpleOpt ( exprIsConAppFor_maybe, joinPointBinding_maybe, joinPointBindings_maybe )
+import qualified GHC.Core.Subst as CoreSubst
+import GHC.Core.FVs     ( mkRuleInfo, hasFreeVarInCoreAnnotationsWith, coreAnnotationVarSets )
 import GHC.Core.Rules   ( lookupRule, getRules )
 import GHC.Core.Multiplicity
 
@@ -57,14 +60,15 @@ import GHC.Types.Demand
 import GHC.Types.Unique ( hasKey )
 import GHC.Types.Basic
 import GHC.Types.Tickish
-import GHC.Types.Var    ( isTyCoVar )
+import GHC.Types.Var    ( isNonCoVarId, isTyCoVar )
+import GHC.Types.Var.Set (VarSet, emptyVarSet, elemVarSet, unionVarSet)
 
 import GHC.Builtin.WiredIn.Prim( realWorldStatePrimTy )
 import GHC.Builtin.KnownKeys( runRWKey, seqHashKey )
 import GHC.Builtin.WiredIn.Ids( seqId )
 
 import qualified GHC.Data.List.Infinite as Inf
-import GHC.Data.Maybe   ( isNothing, orElse, mapMaybe )
+import GHC.Data.Maybe   ( isJust, isNothing, orElse, mapMaybe )
 import GHC.Data.FastString
 import GHC.Unit.Module ( moduleName )
 import GHC.Utils.Outputable
@@ -230,11 +234,18 @@ simplTopBinds env0 binds0
                                       ; return (floats1, env2) }
 
     simpl_bind env (Rec pairs)
-      = simplRecBind env (BC_Let TopLevel Recursive) pairs
+      = simplRecBind top_annotation_refs env (BC_Let TopLevel Recursive) pairs
     simpl_bind env (NonRec b r)
       = do { let bind_cxt = BC_Let TopLevel NonRecursive
            ; (env', b') <- addBndrRules env b (lookupRecBndr env b) bind_cxt
-           ; simplRecOrTopPair env' bind_cxt b b' r }
+           ; simplRecOrTopPair (b `elemVarSet` top_annotation_refs) env' bind_cxt b b' r }
+
+    -- A previous iteration can float a pinned local binder to the top
+    -- level. Collect its annotation uses before reintroducing unfoldings.
+    top_annotation_refs
+      | sm_core_mode (seMode env0) == RetainedCore
+      = foldMap (snd retainedAnnotationVars) binds0
+      | otherwise = emptyVarSet
 
 {-
 ************************************************************************
@@ -247,10 +258,10 @@ simplRecBind is used for
         * recursive bindings only
 -}
 
-simplRecBind :: SimplEnv -> BindContext
+simplRecBind :: VarSet -> SimplEnv -> BindContext
              -> [(InId, InExpr)]
              -> SimplM (SimplFloats, SimplEnv)
-simplRecBind env0 bind_cxt pairs0
+simplRecBind annotation_refs env0 bind_cxt pairs0
   = do  { (env1, triples) <- mapAccumLM add_rules env0 pairs0
         ; let new_bndrs = map sndOf3 triples
         ; (rec_floats, env2) <- enterRecGroupRHSs env1 new_bndrs $ \env ->
@@ -266,7 +277,7 @@ simplRecBind env0 bind_cxt pairs0
     go env [] = return (emptyFloats env, env)
 
     go env ((old_bndr, new_bndr, rhs) : pairs)
-        = do { (float, env1) <- simplRecOrTopPair env bind_cxt
+        = do { (float, env1) <- simplRecOrTopPair (old_bndr `elemVarSet` annotation_refs) env bind_cxt
                                                   old_bndr new_bndr rhs
              ; (floats, env2) <- go env1 pairs
              ; return (float `addFloats` floats, env2) }
@@ -279,13 +290,14 @@ simplOrTopPair is used for
 It assumes the binder has already been simplified, but not its IdInfo.
 -}
 
-simplRecOrTopPair :: SimplEnv
+simplRecOrTopPair :: Bool -> SimplEnv
                   -> BindContext
                   -> InId -> OutBndr -> InExpr  -- Binder and rhs
                   -> SimplM (SimplFloats, SimplEnv)
 
-simplRecOrTopPair env bind_cxt old_bndr new_bndr rhs
-  | Just env' <- preInlineUnconditionally env (bindContextLevel bind_cxt)
+simplRecOrTopPair keep_index env bind_cxt old_bndr new_bndr rhs
+  | not keep_index
+  , Just env' <- preInlineUnconditionally env (bindContextLevel bind_cxt)
                                           old_bndr (UnSimplified env) rhs MRefl
   = {-#SCC "simplRecOrTopPair-pre-inline-uncond" #-}
     simplTrace "SimplBindr:inline-uncond1" (ppr old_bndr) $
@@ -299,7 +311,7 @@ simplRecOrTopPair env bind_cxt old_bndr new_bndr rhs
                                            (old_bndr,env) (new_bndr,env) (rhs,env)
 
       BC_Let top_lvl is_rec -> simplTrace "SimplBind:normal" (ppr old_bndr) $
-                               simplLazyBind top_lvl is_rec
+                               simplLazyBind keep_index top_lvl is_rec
                                              (old_bndr,env) (new_bndr,env) (rhs,env)
 
 simplTrace :: String -> SDoc -> SimplM a -> SimplM a
@@ -310,7 +322,8 @@ simplTrace herald doc thing_inside = do
     else thing_inside
 
 --------------------------
-simplLazyBind :: TopLevelFlag -> RecFlag
+simplLazyBind :: Bool                     -- Keep a binder used in annotations.
+              -> TopLevelFlag -> RecFlag
               -> (InId, SimplEnv)       -- InBinder, and static env for its unfolding (if any)
               -> (OutId, SimplEnv)      -- OutBinder, and SimplEnv after simplifying that binder
                                         -- The OutId has IdInfo (notably RULES),
@@ -319,7 +332,7 @@ simplLazyBind :: TopLevelFlag -> RecFlag
               -> SimplM (SimplFloats, SimplEnv)
 -- Precondition: Ids only, no TyVars; not a JoinId
 -- Precondition: rhs obeys the let-can-float invariant
-simplLazyBind top_lvl is_rec (bndr,unf_se) (bndr1,env) (rhs,rhs_se)
+simplLazyBind keep_index top_lvl is_rec (bndr,unf_se) (bndr1,env) (rhs,rhs_se)
   = assert (isId bndr )
     assertPpr (not (isJoinId bndr)) (ppr bndr) $
     -- pprTrace "simplLazyBind" ((ppr bndr <+> ppr bndr1) $$ ppr rhs $$ ppr (seIdSubst rhs_se)) $
@@ -363,6 +376,12 @@ simplLazyBind top_lvl is_rec (bndr,unf_se) (bndr1,env) (rhs,rhs_se)
                      {-#SCC "simplLazyBind-simple-floating" #-}
                      return (body_floats2, body2)
 
+                else if sm_core_mode (seMode env) == RetainedCore
+                        && any (isRetainedUserUnfolding . realIdUnfolding)
+                             (bindersOfBinds (letFloatBinds (sfLetFloats body_floats2))) then
+                     -- See Note [Floating retained user unfoldings] in GHC.Core.Opt.SetLevels.
+                     return (emptyFloats env, wrapFloats body_floats2 body2)
+
                 else -- Non-empty floats, and non-empty tyvars: do type-abstraction first
                      {-#SCC "simplLazyBind-type-abstraction-first" #-}
                      do { (poly_binds, body3) <- abstractFloats (seUnfoldingOpts env) top_lvl
@@ -372,7 +391,7 @@ simplLazyBind top_lvl is_rec (bndr,unf_se) (bndr1,env) (rhs,rhs_se)
 
         ; let env1 = env `setInScopeFromF` rhs_floats
         ; rhs' <- rebuildLam env1 tvs' body3 rhs_cont
-        ; (bind_float, env2) <- completeBind (BC_Let top_lvl is_rec) (bndr,unf_se) (bndr1,rhs',env1)
+        ; (bind_float, env2) <- completeBind keep_index (BC_Let top_lvl is_rec) (bndr,unf_se) (bndr1,rhs',env1)
         ; return (rhs_floats `addFloats` bind_float, env2) }
 
 --------------------------
@@ -386,7 +405,7 @@ simplJoinBind :: RecFlag
 simplJoinBind is_rec cont (old_bndr, unf_se) (new_bndr, env) (rhs, rhs_se)
   = do  { let rhs_env = rhs_se `setInScopeFromE` env
         ; rhs' <- simplJoinRhs rhs_env old_bndr rhs cont
-        ; completeBind (BC_Join is_rec cont) (old_bndr, unf_se) (new_bndr, rhs', env) }
+        ; completeBind False (BC_Join is_rec cont) (old_bndr, unf_se) (new_bndr, rhs', env) }
 
 --------------------------
 simplAuxBind :: (SimplAltFlag, SimplEnv)
@@ -431,7 +450,7 @@ simplAuxBind (saf,env) bndr new_rhs
 
           -- Simplify the binder and complete the binding
         ; (env1, new_bndr) <- simplAltIdBinder (saf, env `setInScopeFromF` rhs_floats) bndr
-        ; (bind_float, env2) <- completeBind (BC_Let NotTopLevel NonRecursive)
+        ; (bind_float, env2) <- completeBind False (BC_Let NotTopLevel NonRecursive)
                                              (bndr, env) (new_bndr, rhs1, env1)
 
         ; return (rhs_floats `addFloats` bind_float, env2) }
@@ -555,6 +574,13 @@ Wrinkles
    will kill worker-wrapper.  Well, so be it.  They are pretty suspicious anyway;
    see Note [Checking for INLINE loop breakers].
 
+(CWW5) A top-level worker type must not refer to a local runtime index.
+   For example, a cast can close the result of a retained list application by
+   reducing its length. Tidy can restore a local alias inside a top-level
+   RHS but cannot bind that alias in the worker's type. Keep the cast when
+   the worker would violate the same invariant as a top-level binding in
+   Note [Keep retained arguments in prepareRhs].
+
 All these wrinkles are exactly like worker/wrapper for strictness analysis:
   f is the wrapper and must inline like crazy
   $wf is the worker and must carry f's original pragma
@@ -623,6 +649,9 @@ tryCastWorkerWrapper env bind_cxt old_bndr bndr (Cast rhs co)
   , typeHasFixedRuntimeRep work_ty   -- Don't peel off a cast if doing so would
                                      -- lose the underlying runtime representation.
                                      -- See Note [Preserve RuntimeRep info in cast w/w]
+  , not (isTopLevel top_lvl                         -- See (CWW5)
+         && sm_core_mode (seMode env) == RetainedCore
+         && anyFreeVarsOfType isNonCoVarId work_ty)
   , not (isOpaquePragma (idInlinePragma old_bndr)) -- Not for OPAQUE bindings
                                                    -- See Note [OPAQUE pragma]
   = do  { uniq <- getUniqueM
@@ -650,7 +679,7 @@ tryCastWorkerWrapper env bind_cxt old_bndr bndr (Cast rhs co)
                            , extendIdSubst (setInScopeFromF env floats) old_bndr $
                              DoneEx triv_rhs NotJoinPoint ) }
 
-          else do { wrap_unf <- mkLetUnfolding env top_lvl VanillaSrc bndr False triv_rhs
+          else do { wrap_unf <- mkLetUnfolding env top_lvl wrap_src bndr False triv_rhs
                   ; let bndr' = bndr `setInlinePragma` mkCastWrapperInlinePrag (idInlinePragma bndr)
                                 `setIdUnfolding`  wrap_unf
                         floats' = floats `extendFloats` NonRec bndr' triv_rhs
@@ -660,6 +689,9 @@ tryCastWorkerWrapper env bind_cxt old_bndr bndr (Cast rhs co)
     !occ_fs = getOccFS bndr
     work_ty = coercionLKind co
     info   = idInfo bndr
+    wrap_src | isRetainedUserUnfolding (realUnfoldingInfo info) = RetainedUserSrc
+             | otherwise = VanillaSrc
+      -- See Note [Retained user unfoldings across modules] in GHC.Iface.Tidy.
     work_arity = arityInfo info `min` typeArity work_ty
 
     work_info = vanillaIdInfo `setDmdSigInfo`     dmdSigInfo info
@@ -771,7 +803,26 @@ We also want to deal well cases like this
         v = (f e1 `cast` co) e2
 Here we want to make e1,e2 trivial and get
         x1 = e1; x2 = e2; v = (f x1 `cast` co) v2
-That's what the 'go' loop in prepareRhs does
+That's what the 'go' loop in prepareRhs does.
+
+Note [Keep retained arguments in prepareRhs]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The type of a later argument can depend on the expression supplied to a
+retained binder. For example, PackVec (S Z) xs requires xs :: Vec a ('S 'Z).
+Floating S Z into a fresh binding n changes the expected type to Vec a n.
+The new runtime Id is opaque, so the original vector type cannot use that
+Id in place of its constructor index. Keep the retained argument in place.
+Ordinary arguments in the same application can still be made trivial.
+If an argument's type mentions a runtime Id, keep it inside a top-level
+RHS. Naming that argument would give a top-level binder a type that refers
+to the runtime Id. Core Tidy can give the RHS a local alias, but the type
+of the top-level binder would still refer to the original Id.
+See Note [Local indices across Core Tidy] in GHC.Iface.Tidy.
+
+This guard applies only to optional preparation of a top-level RHS.
+The continuation paths call makeTrivial with NotTopLevel, so they still
+bind nontrivial arguments before duplication. A constructor field stays
+lazy in its containing RHS. CorePrep can bind it after index erasure.
 -}
 
 prepareRhs :: HasDebugCallStack
@@ -811,6 +862,12 @@ prepareRhs env top_lvl occ rhs0
         = do { (floats, rhs') <- anfise fun
              ; return (floats, App rhs' (Type ty)) }
     anfise (App fun arg)
+        | sm_core_mode (seMode env) == RetainedCore
+        , Just _ <- retainedArgBinder (exprType fun)
+        -- See Note [Keep retained arguments in prepareRhs].
+        = do { (floats, fun') <- anfise fun
+             ; return (floats, App fun' arg) }
+        | otherwise
         = do { (floats1, fun') <- anfise fun
              ; (floats2, arg') <- makeTrivial env top_lvl topDmd occ arg
              ; return (floats1 `addLetFlts` floats2, App fun' arg') }
@@ -854,6 +911,9 @@ makeTrivial env top_lvl dmd occ_fs expr
   | exprIsTrivial expr                          -- Already trivial
   || not (bindingOk top_lvl expr expr_ty)       -- Cannot trivialise
                                                 --   See Note [Cannot trivialise]
+  || (isTopLevel top_lvl                       -- See Note [Keep retained arguments in prepareRhs]
+      && sm_core_mode (seMode env) == RetainedCore
+      && anyFreeVarsOfType isNonCoVarId expr_ty)
   = return (emptyLetFloats, expr)
 
   | Cast expr' co <- expr
@@ -944,7 +1004,8 @@ It does *not* attempt to do let-to-case.  Why?  Because it is used for
 Nor does it do the atomic-argument thing
 -}
 
-completeBind :: BindContext
+completeBind :: Bool                     -- Keep a binder used in annotations.
+             -> BindContext
              -> (InId, SimplEnv)           -- Old binder, and the static envt in which to simplify
                                            --   its stable unfolding (if any)
              -> (OutId, OutExpr, SimplEnv) -- New binder and rhs; can be a JoinId.
@@ -956,7 +1017,7 @@ completeBind :: BindContext
 --
 -- Binder /can/ be a JoinId
 -- Precondition: rhs obeys the let-can-float invariant
-completeBind bind_cxt (old_bndr, unf_se) (new_bndr, new_rhs, env)
+completeBind keep_index bind_cxt (old_bndr, unf_se) (new_bndr, new_rhs, env)
  | isCoVar old_bndr
  = case new_rhs of
      Coercion co -> return (emptyFloats env, extendCvSubst env old_bndr co)
@@ -972,14 +1033,19 @@ completeBind bind_cxt (old_bndr, unf_se) (new_bndr, new_rhs, env)
       ; (new_arity, eta_rhs) <- tryEtaExpandRhs env bind_cxt new_bndr new_rhs
 
         -- Simplify the unfolding; see Note [Environment for simplLetUnfolding]
-      ; new_unfolding <- simplLetUnfolding (unf_se `setInScopeFromE` env)
-                            bind_cxt old_bndr
-                            eta_rhs (idType new_bndr) new_arity old_unf
+      ; new_unfolding <-
+          -- See Note [Preserving retained annotation uses].
+          if keep_index
+          then return NoUnfolding
+          else simplLetUnfolding (unf_se `setInScopeFromE` env)
+                 bind_cxt old_bndr eta_rhs (idType new_bndr) new_arity old_unf
 
       ; let new_bndr_w_info = addLetBndrInfo new_bndr new_arity new_unfolding
         -- See Note [In-scope set as a substitution]
 
-      ; if postInlineUnconditionally env bind_cxt old_bndr new_bndr_w_info eta_rhs
+      ; if keep_index
+        then return (mkFloatBind env (NonRec new_bndr_w_info eta_rhs))
+        else if postInlineUnconditionally env bind_cxt old_bndr new_bndr_w_info eta_rhs
 
         then -- Inline and discard the binding
              do  { tick (PostInlineUnconditionally old_bndr)
@@ -1225,9 +1291,26 @@ simplExprF1 env (Lit lit)      cont = {-#SCC "rebuild" #-} rebuild env (Lit lit)
 simplExprF1 env (Tick t expr)  cont = {-#SCC "simplTick" #-} simplTick env t expr cont
 simplExprF1 env (Coercion co)  cont = {-#SCC "simplCoercionF" #-} simplCoercionF env co cont
 
+-- See Note [Erased package scopes in the simplifier].
+simplExprF1 env (Pack schema witness payload) cont
+  = do { schema' <- simplType env schema
+       ; witness' <- simplType env witness
+       ; payload' <- simplExpr env payload
+       ; rebuild env (Pack schema' witness' payload') cont }
+
+simplExprF1 env (Unpack witness payload package body) cont
+  = do { package' <- simplExpr env package
+       ; (witness_env, witness') <- simplBinder env witness
+       ; (body_env, payload') <- simplLamBndr witness_env payload
+       ; body' <- simplExpr body_env body
+       ; rebuild env (Unpack witness' payload' package' body') cont }
+
 simplExprF1 env (Cast body co) cont
   = do  { co1 <- {-#SCC "simplCast-simplCoercion" #-}
-                 simplCoercion env co
+                 -- See Note [Simplifying casts on retained values].
+                 if sm_core_mode (seMode env) == RetainedCore
+                 then mapNativeIndexCastCoM (simplCoercion env) co
+                 else simplCoercion env co
 
         ; cont1 <- {-#SCC "simplCast-addCoerce" #-}
                    if isReflCo co1
@@ -1301,7 +1384,8 @@ simplExprF1 env (Let (NonRec bndr rhs) body) cont
     do { ty' <- simplType env ty
        ; simplExprF (extendTvSubst env bndr ty') body cont }
 
-  | Just env' <- preInlineUnconditionally env NotTopLevel bndr (UnSimplified env) rhs MRefl
+  | not keep_index
+  , Just env' <- preInlineUnconditionally env NotTopLevel bndr (UnSimplified env) rhs MRefl
     -- Because of the let-can-float invariant, it's ok to
     -- inline freely, or to drop the binding if it is dead.
   = do { simplTrace "SimplBindr:inline-uncond2" (ppr bndr) $
@@ -1312,13 +1396,30 @@ simplExprF1 env (Let (NonRec bndr rhs) body) cont
   -- test first, because joinPointBinding_maybe has to eta-expand, so a trivial
   -- binding like { j = j2 |> co } would first be eta-expanded and then inlined
   -- Better to test preInlineUnconditionally first.
-  | Just (bndr', rhs') <- joinPointBinding_maybe bndr rhs
+  | not keep_index
+  , Just (bndr', rhs') <- joinPointBinding_maybe bndr rhs
   = {-#SCC "simplNonRecJoinPoint" #-}
     simplNonRecJoinPoint env bndr' rhs' body cont
 
   | otherwise
   = {-#SCC "simplNonRecE" #-}
-    simplNonRecE env FromLet bndr (rhs, env) body cont
+    simplNonRecE env keep_index FromLet bndr (rhs, env) body cont
+  where
+    keep_index = retainedAnnotationUse env bndr body
+
+{- Note [Erased package scopes in the simplifier]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The witness and payload of Pack use the surrounding scope. Unpack
+simplifies the package in the same scope as its outer continuation.
+Freshen the type witness before the payload binder because the
+payload's type can mention the witness. Only the Unpack body uses
+those fresh binders.
+
+Use simplExpr for both children of Unpack and the Pack payload.
+It closes each child's floats in that child. Unpack binds its package
+lazily. A strict continuation for the body result does not make the
+package strict. Rebuild the continuation outside these scopes.
+-}
 
 {- Note [Avoiding space leaks in OutType]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1412,6 +1513,19 @@ simplCoercion env co
     subst = getTCvSubst env
     opts  = seOptCoercionOpts env
     subst_only = isEmptyTvSubst subst || reSimplifying env
+
+{- Note [Simplifying casts on retained values]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A package payload can be cast from its generated family type to Vec a n.
+If it is passed to a retained function, the result type can mention the
+same value at the latter index. The cast on the expression is
+representational, but its SubCo contains the nominal proof used by the
+type. Simplifying the outer coercion can discard that proof, for example
+when the simplifier substitutes an element type. Simplify the recoverable
+nominal proof and restore the value cast. A representational-only
+coercion takes the ordinary path. See Note [Nominal native index casts]
+in GHC.Core.
+-}
 
 {- Note [Optimising coercions]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1675,7 +1789,7 @@ completeBindX env from_what bndr rhs body cont
               -- because this is completeBindX, so bndr is not in scope in the RHS.
 
         ; let env3 = env2 `setInScopeFromF` rhs_floats
-        ; (bind_float, env4) <- completeBind (BC_Let NotTopLevel NonRecursive)
+        ; (bind_float, env4) <- completeBind False (BC_Let NotTopLevel NonRecursive)
                                              (bndr,env) (bndr2, rhs1, env3)
               -- Must pass env1 to completeBind in case simplBinder had to clone,
               -- and extended the substitution with [bndr :-> new_bndr]
@@ -1855,13 +1969,62 @@ simplArg _ _ _ (Simplified {}) arg mco
        MRefl  -> return arg       -- Vastly common case
        MCo co -> return (mkCast arg co)
 simplArg env mb_arg_info fun_ty (UnSimplified arg_se) arg mco
+  | sm_core_mode (seMode env) == RetainedCore
+  , keep_retained_operand
+  -- See Note [Keep checked source calls in retained arguments].
+  = return (mkCastMCo (CoreSubst.substExpr (getFullSubst (getInScope env) arg_se) arg) mco)
+  | otherwise
   = do { let arg_env' = arg_se `setInScopeFromE` env
-             arg_ty   = funArgTy fun_ty
+             arg_ty
+               | sm_core_mode (seMode env) == RetainedCore
+               , Just b <- retainedArgBinder fun_ty = varType b
+               | otherwise = funArgTy fun_ty
              stop     = case mb_arg_info of
                            Nothing -> mkBoringStop arg_ty
                            Just ai -> mkLazyArgStop arg_ty ai
              cont     = addCastMCo mco stop
        ; simplExprC arg_env' arg cont }
+  where
+    keep_retained_operand = case coreFullView fun_ty of
+      DepDictTy{} -> True
+      DepFunTy _ binder body
+        | isNativeIndexFunctionId binder
+        , not (isVacuousRetainedBinder binder body)
+        , (Var fun, _) <- collectArgs arg
+        , isExternalName (idName fun)
+        , isJust (nativeIndexFunctionArgIndex arg)
+        -> True
+      DepFunTy{} -> isJust (nativeComputedIndex arg) || isJust (nativeClassSelectorIndex arg)
+      _ -> False
+
+-- | Find the argument binder of a retained value or private dictionary arrow.
+retainedArgBinder :: Type -> Maybe Id
+retainedArgBinder ty = case coreFullView ty of
+  DepFunTy _ b _ -> Just b
+  DepDictTy b _ -> Just b
+  _ -> Nothing
+
+{- Note [Keep checked source calls in retained arguments]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For a retained application such as `booleanResult (not x)`, the result
+type mentions the checked source family for `not x`. Inlining `not`
+replaces the call with a case. The case has no index in the operand
+grammar, so Core Lint can no longer instantiate the result type.
+
+A named callback can determine the result type by its Name or its
+source table. Keep the original Id and its erased arguments. Inlining
+the body can replace the callback with an Id that has a different index.
+
+Apply the lexical substitution, but leave the checked call tree in place.
+This includes calls nested in constructor arguments. The ordinary
+argument path and calls outside retained operands still use the inliner
+and rules. CorePrep can bind the operand lazily after index erasure.
+
+Case-of-case can duplicate the application continuation. Keep the
+retained operand in each branch. Naming it `karg` would change the
+result's index to `karg` without evidence of its equality to the
+original expression. Only the selected branch can evaluate the argument.
+-}
 
 {-
 ************************************************************************
@@ -1894,6 +2057,17 @@ simpl_lam env bndr body (ApplyToTy { sc_arg_ty = arg_ty, sc_cont = cont })
   = do { tick (BetaReduction bndr)
        ; simplLam (extendTvSubst env bndr arg_ty) body cont }
 
+-- An ordinary result type can hide uses of this binder in the body's types
+-- and coercions. Value beta substitution does not rewrite those occurrences.
+-- See Note [Retained Core in the Gentle simplifier] in GHC.Driver.Main.Passes.
+simpl_lam env bndr body cont@ApplyToVal{sc_hole_ty = fun_ty}
+  | sm_core_mode (seMode env) == RetainedCore
+  , isJust (retainedArgBinder fun_ty) || retainedAnnotationUse env bndr body
+  = do { let (inner_bndrs, inner_body) = collectBinders body
+       ; (env', bndrs') <- simplLamBndrs env (bndr:inner_bndrs)
+       ; body' <- simplExpr env' inner_body
+       ; rebuild env (mkLams bndrs' body') cont }
+
 -- Value beta-reduction
 -- This works for /coercion/ lambdas too
 simpl_lam env bndr body (ApplyToVal { sc_arg = arg, sc_env = arg_se
@@ -1918,7 +2092,7 @@ simpl_lam env bndr body (ApplyToVal { sc_arg = arg, sc_env = arg_se
              -- Optimisation: when there is no wrapping coercion use simplNonRecE
              -- so that the clever floating out of let-bindings can take place
              -- in this round of the Simplifier
-             -> simplNonRecE env from_what bndr (arg, arg_env) body cont
+             -> simplNonRecE env False from_what bndr (arg, arg_env) body cont
 
            _ -> do { arg' <- simplArg env Nothing fun_ty arg_se arg arg_mco
                    ; completeBindX env from_what bndr arg' body cont }
@@ -1966,8 +2140,58 @@ simplLamBndrs :: SimplEnv -> [InBndr] -> SimplM (SimplEnv, [OutBndr])
 simplLamBndrs env bndrs = mapAccumLM simplLamBndr env bndrs
 
 ------------------
+{- Note [Preserving retained annotation uses]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Ordinary value substitution changes term occurrences without replacing
+their runtime Ids in types. Keeping a binding alone is insufficient.
+If its unfolding replaced a retained operand, the term could use a
+different index while the type still refers to the original binder.
+Leave the binding in scope and do not install an unfolding for it.
+A private class selector type can also refer to its evidence variable.
+Keep that dictionary binder under the same condition.
+
+An application can need its local callback even if no written annotation
+mentions it. For example, in `let f = imported in accepts f x (token f x)`,
+the index `f x` is computed from the application spine. Substituting the
+imported function for `f` would lose the eligible local callback. Keep the
+binding if a non-vacuous retained function operand refers to it.
+
+The same restriction applies to known constructor elimination. It creates
+auxiliary bindings for the case binder and payload fields. Do not enter
+that path if the selected RHS has annotations that refer to one of those
+binders. Other alternatives and ordinary Core still use the existing
+known-constructor optimisation. A future substitution can remove these
+guards when it updates term and annotation occurrences together.
+-}
+
+-- | Check whether value substitution would leave an old runtime index.
+-- See Note [Preserving retained annotation uses].
+retainedAnnotationUse :: SimplEnv -> InId -> InExpr -> Bool
+retainedAnnotationUse env bndr body =
+  sm_core_mode (seMode env) == RetainedCore
+  && (isNativeOpaqueValueId bndr || isNativeClassDictionaryId bndr)
+  && hasFreeVarInCoreAnnotationsWith callback_use bndr body
+  where
+    callback_use fun arg = isNativeIndexFunctionId bndr
+                         && bndr `elemVarSet` retainedCallbackOperandVars fun arg
+
+-- | Track callback operands after a previous pass has floated their bindings.
+retainedAnnotationVars :: (InExpr -> VarSet, InBind -> VarSet)
+retainedAnnotationVars = coreAnnotationVarSets retainedCallbackOperandVars
+
+-- | A callback operand can determine the type of later arguments in its spine.
+retainedCallbackOperandVars :: InExpr -> InExpr -> VarSet
+retainedCallbackOperandVars fun arg
+  | Just index <- nativeLocalFunctionArgIndex arg
+  , DepFunTy _ callback result <- coreFullView (exprType fun)
+  , isNativeIndexFunctionId callback
+  , not (isVacuousRetainedBinder callback result)
+  = tyCoVarsOfType index
+  | otherwise = emptyVarSet
+
 simplNonRecE :: HasDebugCallStack
              => SimplEnv
+             -> Bool              -- Keep a binder used in annotations.
              -> FromWhat
              -> InId               -- The binder, always an Id
                                    -- Never a join point
@@ -1991,9 +2215,10 @@ simplNonRecE :: HasDebugCallStack
 -- from_what=FromLet => the RHS satisfies the let-can-float invariant
 -- Otherwise it may or may not satisfy it.
 
-simplNonRecE env from_what bndr (rhs, rhs_se) body cont
+simplNonRecE env keep_index from_what bndr (rhs, rhs_se) body cont
   | assert (isId bndr && not (isJoinId bndr) ) $
     is_strict_bind
+  , not keep_index
   = -- Evaluate RHS strictly
     simplExprF (rhs_se `setInScopeFromE` env) rhs
                (StrictBind { sc_bndr = bndr, sc_body = body, sc_from = from_what
@@ -2002,7 +2227,7 @@ simplNonRecE env from_what bndr (rhs, rhs_se) body cont
   | otherwise  -- Evaluate RHS lazily
   = do { (env1, bndr1)    <- simplNonRecBndr env bndr
        ; (env2, bndr2)    <- addBndrRules env1 bndr bndr1 (BC_Let NotTopLevel NonRecursive)
-       ; (floats1, env3)  <- simplLazyBind NotTopLevel NonRecursive
+       ; (floats1, env3)  <- simplLazyBind keep_index NotTopLevel NonRecursive
                                            (bndr,env) (bndr2,env2) (rhs,rhs_se)
        ; (floats2, expr') <- simplNonRecBody env3 from_what body cont
        ; return (floats1 `addFloats` floats2, expr') }
@@ -2034,9 +2259,14 @@ simplRecE env pairs body cont
         ; env1 <- simplRecBndrs env bndrs
                 -- NB: bndrs' don't have unfoldings or rules
                 -- We add them as we go down
-        ; (floats1, env2)  <- simplRecBind env1 (BC_Let NotTopLevel Recursive) pairs
+        ; (floats1, env2)  <- simplRecBind annotation_refs env1 (BC_Let NotTopLevel Recursive) pairs
         ; (floats2, expr') <- simplExprF env2 body cont
         ; return (floats1 `addFloats` floats2, expr') }
+  where
+    annotation_refs
+      | sm_core_mode (seMode env) == RetainedCore
+      = snd retainedAnnotationVars (Rec pairs) `unionVarSet` fst retainedAnnotationVars body
+      | otherwise = emptyVarSet
 
 {- Note [Dark corner with representation polymorphism]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2114,7 +2344,7 @@ simplRecJoinPoint env pairs body cont
        ; env1 <- simplRecJoinBndrs env bndrs mult res_ty
                -- NB: bndrs' don't have unfoldings or rules
                -- We add them as we go down
-       ; (floats1, env2)  <- simplRecBind env1 (BC_Join Recursive cont) pairs
+       ; (floats1, env2)  <- simplRecBind emptyVarSet env1 (BC_Join Recursive cont) pairs
        ; (floats2, body') <- simplExprF env2 body cont
        ; return (floats1 `addFloats` floats2, body') }
 
@@ -2317,7 +2547,7 @@ simplOutExpr env expr cont
 
   | Lam {} <- expr
   , cont_has_args
-  = simplLam env (occurAnalyseExpr expr) cont
+  = simplLam env (occurAnalyseExprWithMode (sm_core_mode (seMode env)) expr) cont
     -- ToDo:explain; c.f. Note [Occurrence-analyse after rule firing]
 
   | Cast e co <- expr  -- The inlined expression may be (x |> co)
@@ -2381,9 +2611,9 @@ simplOutId env fun cont
                             -- See Note [No eta-expansion in runRW#]
 
            _ -> do { s' <- newId (fsLit "s") ManyTy realWorldStatePrimTy
-                   ; let (m,_,_) = splitFunTy fun_ty
+                   ; let (ma,m,_,_) = splitFunTy fun_ty
                          env'  = arg_env `addNewInScopeIds` [s']
-                         hole_ty = mkVisFunTy m realWorldStatePrimTy new_runrw_res_ty
+                         hole_ty = mkVisFunTy ma m realWorldStatePrimTy new_runrw_res_ty
                    ; cont' <- pushCastMCo env' arg_mco $
                               ApplyToVal { sc_arg = Var s', sc_cast = MRefl
                                          , sc_env = Simplified OkDup
@@ -2460,6 +2690,7 @@ rebuildCall env fun_info
                         , sc_hole_ty = fun_ty, sc_cont = cont })
   | UnSimplified arg_env <- arg_se
   , isStrictArgInfo fun_info  -- Strict arguments
+  , not (sm_core_mode (seMode env) == RetainedCore && is_retained_arrow fun_ty)
   , seCaseCase env            -- But only when case-of-case is on.
                               -- See Note [Case-of-case and full laziness]
   = simplExprF (arg_env `setInScopeFromE` env) arg $
@@ -2476,6 +2707,10 @@ rebuildCall env fun_info
   -- floating a demanded let.
   = do  { arg' <- simplArg env (Just fun_info) fun_ty arg_se arg arg_mco
         ; rebuildCall env (addValArgTo fun_info  arg' fun_ty) cont }
+  where
+    -- StrictArg moves evaluation contexts across a call argument. Keep a
+    -- retained argument's expression in place for result-type instantiation.
+    is_retained_arrow = isJust . retainedArgBinder
 
 ---------- No further useful info, revert to generic rebuild ------------
 rebuildCall env (ArgInfo { ai_fun = fun, ai_args = rev_arg_specs, ai_rules = rules }) cont
@@ -3223,6 +3458,11 @@ rebuildCase, reallyRebuildCase
 --      1. Eliminate the case if there's a known constructor
 --------------------------------------------------
 
+rebuildCase ctxt@(_,env) scrut case_bndr alts cont
+  | sm_core_mode (seMode env) == RetainedCore
+  , any (\alt -> isNativeIndexAlt alt || isNativeIndexAliasAlt alt) alts
+  = reallyRebuildCase ctxt scrut case_bndr alts cont
+
 rebuildCase (saf,env) scrut case_bndr alts cont
   | Lit lit <- scrut    -- No need for same treatment as constructors
                         -- because literals are inlined more vigorously
@@ -3233,24 +3473,31 @@ rebuildCase (saf,env) scrut case_bndr alts cont
             Just (Alt _ bs rhs) -> simpl_rhs env scrut bs rhs }
 
   | Just (in_scope', wfloats, con, ty_args, other_args)
-      <- exprIsConApp_maybe (getUnfoldingInRuleMatch env) scrut
+      <- exprIsConAppFor_maybe (sm_core_mode (seMode env)) (getUnfoldingInRuleMatch env) scrut
         -- Works when the scrutinee is a variable with a known unfolding
         -- as well as when it's an explicit constructor application
-  , let env0 = setInScopeSet env in_scope'
-  = do  { tick (KnownBranch case_bndr)
+  , let selected = findAlt (DataAlt con) alts
+  = if sm_core_mode (seMode env) == RetainedCore
+       && maybe False keeps_index selected
+    then reallyRebuildCase (saf,env) scrut case_bndr alts cont
+    else do { let env0 = setInScopeSet env in_scope'
+            ; tick (KnownBranch case_bndr)
         ; let -- case_bndr_unf: see Note [Do not duplicate constructor applications]
               case_bndr_rhs | exprIsTrivial scrut = scrut
                             | otherwise           = con_app
               con_app = Var (dataConWorkId con) `mkTyApps` ty_args
                                                 `mkApps`   other_args
         ; wrapDataConFloats env wfloats case_bndr cont $
-          case findAlt (DataAlt con) alts of
+          case selected of
             Nothing                   -> missingAlt env0 case_bndr alts cont
             Just (Alt DEFAULT bs rhs) -> simpl_rhs env0 case_bndr_rhs bs rhs
             Just (Alt _       bs rhs) -> knownCon env0 scrut con other_args
                                                   case_bndr bs rhs cont
         }
   where
+    keeps_index (Alt _ bs rhs) =
+      any (\b -> retainedAnnotationUse env b rhs) (case_bndr : bs)
+
     simpl_rhs env case_bndr_rhs bs rhs
       = assert (null bs) $
         do { (floats1, env') <- simplAuxBind (saf,env) case_bndr case_bndr_rhs
@@ -3286,6 +3533,7 @@ rebuildCase (saf,env) scrut case_bndr alts@[Alt _ bndrs rhs] cont
   -- See Note [Case to let transformation]
   | all_dead_bndrs
   , doCaseToLet scrut case_bndr
+  , not (retainedAnnotationUse env case_bndr rhs)
   = do { tick (CaseElim case_bndr)
        ; (floats1, env')  <- simplAuxBind (saf,env) case_bndr scrut
          -- simplAuxBind can create a substitution for case_bndr,
@@ -3513,11 +3761,18 @@ simplAlts (saf,env0) scrut case_bndr alts cont'
               env2       = modifyInScope env1 case_bndr2
               -- See Note [Case binder evaluated-ness]
               fam_envs   = seFamEnvs env0
+              alias_proof = sm_core_mode (seMode env0) == RetainedCore
+                         && any isNativeIndexAliasAlt alts
+                            -- See Note [Retained default alternatives].
 
-        ; (alt_env', scrut', case_bndr') <- improveSeq fam_envs (saf,env2) scrut
-                                                       case_bndr case_bndr2 alts
+        ; (alt_env', scrut', case_bndr') <-
+            if alias_proof
+            then return (env2, scrut, case_bndr2)
+            else improveSeq fam_envs (saf,env2) scrut case_bndr case_bndr2 alts
 
-        ; (imposs_deflt_cons, in_alts) <- prepareAlts scrut' case_bndr alts
+        ; (imposs_deflt_cons, in_alts) <-
+            if alias_proof then return ([], alts)
+                           else prepareAlts scrut' case_bndr alts
           -- NB: it's possible that the returned in_alts is empty: this is handled
           --     by the caller (rebuildCase) in the missingAlt function
           -- NB: pass case_bndr::InId, not case_bndr' :: OutId, to prepareAlts
@@ -3530,8 +3785,19 @@ simplAlts (saf,env0) scrut case_bndr alts cont'
         ; let alts_ty' = contResultType cont'
         -- See Note [Avoiding space leaks in OutType]
         ; seqType alts_ty' `seq`
-          mkCase (seMode env0) scrut' case_bndr' alts_ty' alts' }
+            if alias_proof
+            then return (Case scrut' case_bndr' alts_ty' alts')
+            else mkCase (seMode env0) scrut' case_bndr' alts_ty' alts' }
 
+{- Note [Retained default alternatives]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A default alternative can bind nominal evidence that relates the case binder
+to the runtime function call. See Note [Opaque native call indices] in
+GHC.Core.TyCo.Rep. Keep the scrutinee, case binder and proof in their original
+scope. prepareAlts calls findDefault and addDefault, which keep only the RHS
+of a default alternative. mkCase can also merge a default alternative and
+discard its binders. Neither operation can preserve the proof.
+-}
 
 ------------------------------------
 improveSeq :: (FamInstEnv, FamInstEnv)
@@ -3542,13 +3808,33 @@ improveSeq :: (FamInstEnv, FamInstEnv)
 improveSeq fam_envs (saf,env) scrut case_bndr case_bndr1 [Alt DEFAULT _ _]
   | SAF_In <- saf  -- improveSeq extends the substitution; not allowed for SAF_Out
   , Just (Reduction co ty2) <- topNormaliseType_maybe fam_envs (idType case_bndr1)
-  = do { case_bndr2 <- newId (fsLit "nt") ManyTy ty2
+  -- See Note [Retained case binders in improveSeq].
+  , not (sm_core_mode (seMode env) == RetainedCore
+         && isNativeOpaqueValueId case_bndr1
+         && (not (isDeadBinder case_bndr) || isJust (termVar_maybe scrut)))
+  -- The cast changes the scrutinee type. Preserve the case multiplicity.
+  = do { case_bndr2 <- newId (fsLit "nt") (idMult case_bndr1) ty2
         ; let rhs  = DoneEx (Var case_bndr2 `Cast` mkSymCo co) NotJoinPoint
-              env2 = extendIdSubst env case_bndr rhs
+              -- Retained alternatives skip addDefaultUnfoldings. The
+              -- replacement binder must already be in scope in either path.
+              env2 = extendIdSubst (addNewInScopeIds env [case_bndr2]) case_bndr rhs
         ; return (env2, scrut `Cast` co, case_bndr2) }
 
 improveSeq _ (_,env) scrut _ case_bndr1 _
   = return (env, scrut, case_bndr1)
+
+{- Note [Retained case binders in improveSeq]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An ordinary strict binding can name a value at a data family application.
+Its RHS is evaluated by a DEFAULT case. The case body can use the
+binder as a retained operand at the public family type.
+
+Normalising the scrutinee would substitute a variable of the
+representation type with a representational cast for the original
+binder. That cast does not supply a nominal index at the public type.
+Keep the original strict case and its binder when retained Core can use
+the binder's identity. A dead binder needs no replacement.
+-}
 
 
 ------------------------------------
@@ -3562,6 +3848,21 @@ simplAlt :: (SimplAltFlag, SimplEnv)
          -> SimplCont
          -> InAlt
          -> SimplM OutAlt
+
+simplAlt (saf,env) _ _ _ _ cont' alt@(Alt con bndrs rhs)
+  -- See Note [Retained Core in the Gentle simplifier] in GHC.Driver.Main.Passes.
+  | sm_core_mode (seMode env) == RetainedCore
+  = do { (env', bndrs') <- case saf of
+           SAF_In | reSimplifying env, retained_binders -> cloneRetainedAltBinders env bndrs
+           _ -> simplAltBinders (saf,env) bndrs
+       ; rhs' <- simplAltExprC (saf,env') rhs cont'
+       ; return (Alt con bndrs' rhs') }
+  where
+    -- See Note [Inlining retained constructor alternatives].
+    retained_binders = case con of
+      DataAlt dc -> not (null (dataConRepArgBinders dc)) || isNativeIndexAlt alt
+      DEFAULT    -> isNativeIndexAliasAlt alt
+      LitAlt{}   -> False
 
 simplAlt (saf,env) _scrut' imposs_deflt_cons case_bndr' bndr_swap' cont' (Alt DEFAULT bndrs rhs)
   = assert (null bndrs) $
@@ -3593,6 +3894,25 @@ simplAlt (saf,env) scrut' _ case_bndr' bndr_swap' cont' (Alt (DataAlt con) vs rh
 
         ; rhs' <- simplAltExprC (saf,env'') rhs cont'
         ; return (Alt (DataAlt con) vs' rhs') }
+
+{- Note [Inlining retained constructor alternatives]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Two copies of withPair can initially occur in separate arguments. A later
+case transformation can nest the alternatives. The first copy can bind
+x :: Nat while the second binds x :: IO Int. Reusing a field Unique across
+the copies would let an inner witness capture an outer index.
+
+Allocate fresh field and proof binders while simplifying the copied
+alternative. Clone them from left to right so each payload type refers to
+its own witness. Extend the expression, index and coercion substitutions
+before simplifying the RHS. See Note [Linting retained constructor fields]
+in GHC.Core.Lint.
+
+Known-constructor elimination can also copy a binder and remove its
+alternative. It can float the auxiliary let to the top level. That puts
+the binder in scope in the original function, which still binds the same
+Unique in its alternative. Give the copy a fresh Unique before making the let.
+-}
 
 {- Note [Adding evaluatedness info to pattern-bound variables]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -3759,7 +4079,11 @@ simplAltIdBinder :: (SimplAltFlag, SimplEnv) -> Id -> SimplM (SimplEnv, OutId)
 simplAltIdBinder (saf,env) bndr
   = case saf of
       SAF_Out -> return (env, bndr)
-      SAF_In ->  simplNonRecBndr env bndr
+      SAF_In
+        -- See Note [Inlining retained constructor alternatives].
+        | sm_core_mode (seMode env) == RetainedCore
+        , reSimplifying env -> cloneRetainedCaseBinder env bndr
+        | otherwise -> simplNonRecBndr env bndr
 
 simplAltExprF :: HasDebugCallStack
               => (SimplAltFlag, SimplEnv) -> CoreExpr -> SimplCont
@@ -3977,7 +4301,7 @@ knownCon env scrut dc dc_args case_bndr alt_bndrs rhs cont
 
       | otherwise
       = do { (env1, case_bndr1) <- simplAltIdBinder (SAF_In,env) case_bndr
-           ; simplLazyBind NotTopLevel NonRecursive
+           ; simplLazyBind False NotTopLevel NonRecursive
                            (case_bndr,env) (case_bndr1,env1) (con_app,env) }
 
 -------------------
@@ -4181,7 +4505,7 @@ mkDupableContWithDmds env _
     --   K[ f a b <> ]   -->   join j x = K[ f a b x ]
     --                         j <>
     do { let rhs_ty       = contResultType cont
-             (m,arg_ty,_) = splitFunTy fun_ty
+             (_,m,arg_ty,_) = splitFunTy fun_ty
        ; arg_bndr <- newId (fsLit "arg") m arg_ty
        ; let env' = env `addNewInScopeIds` [arg_bndr]
        ; (floats, join_rhs) <- rebuildCall env' (addValArgTo fun (Var arg_bndr) fun_ty) cont
@@ -4217,10 +4541,15 @@ mkDupableContWithDmds env dmds
         ; (floats1, cont') <- mkDupableContWithDmds env cont_dmds cont
         ; let env' = env `setInScopeFromF` floats1
         ; arg' <- simplArg env' Nothing hole_ty se arg arg_mco
-        ; (let_floats2, triv_arg) <- makeTrivial env' NotTopLevel dmd (fsLit "karg") arg'
+        ; (let_floats2, arg'') <-
+            if | sm_core_mode (seMode env) == RetainedCore
+               , DepFunTy{} <- coreFullView hole_ty
+                 -- See Note [Keep checked source calls in retained arguments].
+                 -> return (emptyLetFloats, arg')
+               | otherwise -> makeTrivial env' NotTopLevel dmd (fsLit "karg") arg'
         ; let all_floats = floats1 `addLetFloats` let_floats2
         ; return ( all_floats
-                 , ApplyToVal { sc_arg = triv_arg, sc_env = Simplified OkDup
+                 , ApplyToVal { sc_arg = arg'', sc_env = Simplified OkDup
                               , sc_cast = MRefl, sc_cont = cont', sc_hole_ty = hole_ty }) }
 
 mkDupableContWithDmds env _
@@ -5070,6 +5399,6 @@ simplRules env mb_new_id rules bind_cxt
            ; return (rule { ru_bndrs = bndrs'
                           , ru_fn    = fn_name'
                           , ru_args  = args'
-                          , ru_rhs   = occurAnalyseExpr rhs' }) }
+                          , ru_rhs   = occurAnalyseExprWithMode (sm_core_mode (seMode env)) rhs' }) }
                             -- Remember to occ-analyse, to drop dead code.
                             -- See Note [OccInfo in unfoldings and rules] in GHC.Core

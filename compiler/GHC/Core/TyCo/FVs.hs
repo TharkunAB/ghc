@@ -65,7 +65,9 @@ module GHC.Core.TyCo.FVs
 
 import GHC.Prelude
 
-import {-# SOURCE #-} GHC.Core.Type( partitionInvisibleTypes, coreView, rewriterView )
+import {-# SOURCE #-} GHC.Core.Type
+  ( partitionInvisibleTypes, coreView, rewriterView
+  , typeKind, isMatchableFunTy )
 
 import GHC.Builtin.WiredIn.Prim( funTyFlagTyCon )
 
@@ -87,6 +89,7 @@ import GHC.Utils.Misc
 import GHC.Utils.EndoOS
 
 import GHC.Data.Pair
+import GHC.Data.Maybe (orElse)
 
 import Data.Semigroup
 
@@ -101,6 +104,10 @@ import Data.Semigroup
 {- Note [Shallow and deep free variables]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Definitions
+
+Runtime index identifiers are also free variables of types. These occurrences
+record scope dependencies. They do not record runtime usage. A named global
+call has no lexical scope dependency. The interface tracks its defining Name.
 
 * Shallow free variables of a type: the variables
   affected by substitution. Specifically, the (TyVarTy tv)
@@ -289,12 +296,21 @@ deepFolder :: Monoid fv
 deepFolder occ fvs_of_type add_bndr
   = TyCoFolder { tcf_view = noView  -- See Note [Free vars and synonyms]
                , tcf_tyvar = occ, tcf_covar = occ
+               , tcf_termvar = scopedTermOccurrence occ
                , tcf_hole  = fvs_of_type . coHoleCoVar
                      -- We don't collect the CoercionHole itself, but we /do/
                      -- need to collect the free variables of its /kind/
                      -- See Note [CoercionHoles and coercion free variables]
                , tcf_lit   = const mempty
-               , tcf_tycobinder = add_bndr }
+               , tcf_tycobinder = add_bndr
+               , tcf_termbinder = add_bndr }
+
+-- | Collect a lexical index occurrence. A global head has a closed type.
+{-# INLINE scopedTermOccurrence #-}
+scopedTermOccurrence :: Monoid fv => (Id -> fv) -> Id -> fv
+scopedTermOccurrence occ v
+  | isGlobalId v = mempty
+  | otherwise = occ v
 
 deepUnitFV :: (TyCoVar -> TyCoFV) -- ^ the free variables of a variable's type
            -> TyCoVar -> TyCoFV
@@ -342,8 +358,10 @@ shallowCosFV   :: [Coercion] -> TyCoFV
 shallowTcvFolder :: TyCoFolder TyCoFV
 shallowTcvFolder = TyCoFolder { tcf_view = noView  -- See Note [Free vars and synonyms]
                               , tcf_tyvar = do_tcv, tcf_covar = do_tcv
+                              , tcf_termvar = scopedTermOccurrence do_tcv
                               , tcf_hole  = do_hole, tcf_lit = const mempty
-                              , tcf_tycobinder = addBndrFV }
+                              , tcf_tycobinder = addBndrFV
+                              , tcf_termbinder = addBndrFV }
   where
     do_tcv = shallowUnitFV
     do_hole _  = mempty   -- Ignore coercion holes
@@ -640,8 +658,10 @@ selectiveTcvFolder :: TyCoFolder SelectiveDFV
 selectiveTcvFolder
   = TyCoFolder { tcf_view  = noView  -- See Note [Free vars and synonyms]
                , tcf_tyvar = shallowSelUnitFV, tcf_covar = shallowSelUnitFV
+               , tcf_termvar = scopedTermOccurrence shallowSelUnitFV
                , tcf_hole  = do_hole, tcf_lit = const mempty
-               , tcf_tycobinder = addBndrSelectiveFV }
+               , tcf_tycobinder = addBndrSelectiveFV
+               , tcf_termbinder = addBndrSelectiveFV }
   where
     do_hole hole = shallowSelTypeFV (varType (coHoleCoVar hole))
 
@@ -729,8 +749,10 @@ deepCoVarCosFV :: [Coercion] -> CoVarFV
 deepCoVarFolder :: TyCoFolder CoVarFV
 deepCoVarFolder = TyCoFolder { tcf_view = noView
                              , tcf_tyvar = do_tyvar, tcf_covar = do_covar
+                             , tcf_termvar = deepCoVarTypeFV . varType
                              , tcf_hole  = do_hole, tcf_lit = const mempty
-                             , tcf_tycobinder = addBndrFV }
+                             , tcf_tycobinder = addBndrFV
+                             , tcf_termbinder = addBndrFV }
   where
     do_tyvar _  = mempty
       -- This do_tyvar means we won't see any CoVars in this
@@ -772,11 +794,13 @@ univCoDepsFolder
     -- The following is incorrect: it ignores CoVars/CoercionHoles in the kinds
     -- of TyVars. This replicates the long-standing wart in 'deepCoVarFolder'.
   , tcf_tyvar      = \ _ -> mempty
+  , tcf_termvar    = univCoDepsOfTypesFV . (:[]) . varType
 
   , tcf_covar      = do_covar
   , tcf_hole       = do_hole
   , tcf_lit        = const mempty
-  , tcf_tycobinder = addBndrFV }
+  , tcf_tycobinder = addBndrFV
+  , tcf_termbinder = addBndrFV }
   where
     do_covar v = MkFV $ \ bvs -> EndoOS (add_covar bvs v)
     do_hole h  = MkFV $ \ _   -> EndoOS (addUnivCoDepHole h)
@@ -816,11 +840,13 @@ holeSearchFolder
 
     -- Wart (see 'deepCoVarFolder'): don't look into the kinds of TyVars.
   , tcf_tyvar      = \ _ -> mempty
+  , tcf_termvar    = hole_search_ty . varType
 
   , tcf_covar      = do_covar
   , tcf_hole       = do_hole
   , tcf_lit        = const mempty
-  , tcf_tycobinder = addBndrFV }
+  , tcf_tycobinder = addBndrFV
+  , tcf_termbinder = addBndrFV }
   where
     do_covar v = MkFV $ \ bvs -> EndoOS (search_kind bvs v)
     do_hole _  = MkFV $ \ _   -> EndoOS found_hole
@@ -881,11 +907,20 @@ almost_devoid_co_var_of_co (TyConAppCo _ _ cos) cv
 almost_devoid_co_var_of_co (AppCo co arg) cv
   = almost_devoid_co_var_of_co co cv
   && almost_devoid_co_var_of_co arg cv
-almost_devoid_co_var_of_co (ForAllCo { fco_tcv = v, fco_kind = kind_co, fco_body = co }) cv
-  = almost_devoid_co_var_of_mco kind_co cv
+almost_devoid_co_var_of_co (TermAppCo f co) cv
+  = almost_devoid_co_var_of_type (varType f) cv
+  && almost_devoid_co_var_of_co co cv
+almost_devoid_co_var_of_co (DepFunCo _ _ v domain co) cv
+  = almost_devoid_co_var_of_type (varType v) cv
+  && almost_devoid_co_var_of_mco domain cv
+  && almost_devoid_co_var_of_co co cv
+almost_devoid_co_var_of_co (ForAllCo { fco_tcv = v, fco_ma = ma, fco_kind = kind_co, fco_body = co }) cv
+  = almost_devoid_co_var_of_co ma cv
+  && almost_devoid_co_var_of_mco kind_co cv
   && (v == cv || almost_devoid_co_var_of_co co cv)
-almost_devoid_co_var_of_co (FunCo { fco_mult = w, fco_arg = co1, fco_res = co2 }) cv
-  =  almost_devoid_co_var_of_co w   cv
+almost_devoid_co_var_of_co (FunCo { fco_ma = ma, fco_mult = w, fco_arg = co1, fco_res = co2 }) cv
+  =  almost_devoid_co_var_of_co ma  cv
+  && almost_devoid_co_var_of_co w   cv
   && almost_devoid_co_var_of_co co1 cv
   && almost_devoid_co_var_of_co co2 cv
 almost_devoid_co_var_of_co (CoVarCo v) cv = v /= cv
@@ -921,18 +956,36 @@ almost_devoid_co_var_of_cos (co:cos) cv
 
 almost_devoid_co_var_of_type :: Type -> CoVar -> Bool
 almost_devoid_co_var_of_type (TyVarTy _) _ = True
+almost_devoid_co_var_of_type (ClassAppTy _ inst dict operand kind) cv
+  = all (flip almost_devoid_co_var_of_type cv) [inst, dict, operand, kind]
+almost_devoid_co_var_of_type (DepDictTy v ty) cv
+  = almost_devoid_co_var_of_type (varType v) cv && almost_devoid_co_var_of_type ty cv
+almost_devoid_co_var_of_type (TermAppTy f arg) cv
+  = almost_devoid_co_var_of_type (varType f) cv
+  && almost_devoid_co_var_of_type arg cv
+almost_devoid_co_var_of_type (TermVarTy v) cv
+  = almost_devoid_co_var_of_type (varType v) cv
+almost_devoid_co_var_of_type (ExistsTy _ v ty) cv
+  = almost_devoid_co_var_of_type (varType v) cv
+  && almost_devoid_co_var_of_type ty cv
+almost_devoid_co_var_of_type (DepFunTy _ v ty) cv
+  = almost_devoid_co_var_of_type (varType v) cv
+  && almost_devoid_co_var_of_type (idMult v) cv
+  && almost_devoid_co_var_of_type ty cv
 almost_devoid_co_var_of_type (TyConApp _ tys) cv
   = almost_devoid_co_var_of_types tys cv
 almost_devoid_co_var_of_type (LitTy {}) _ = True
 almost_devoid_co_var_of_type (AppTy fun arg) cv
   = almost_devoid_co_var_of_type fun cv
   && almost_devoid_co_var_of_type arg cv
-almost_devoid_co_var_of_type (FunTy _ w arg res) cv
-  = almost_devoid_co_var_of_type w cv
+almost_devoid_co_var_of_type (FunTy _ ma w arg res) cv
+  = almost_devoid_co_var_of_type ma cv
+  && almost_devoid_co_var_of_type w cv
   && almost_devoid_co_var_of_type arg cv
   && almost_devoid_co_var_of_type res cv
-almost_devoid_co_var_of_type (ForAllTy (Bndr v _) ty) cv
-  = almost_devoid_co_var_of_type (varType v) cv
+almost_devoid_co_var_of_type (ForAllTy ma (Bndr v _) ty) cv
+  = almost_devoid_co_var_of_type ma cv
+  && almost_devoid_co_var_of_type (varType v) cv
   && (v == cv || almost_devoid_co_var_of_type ty cv)
 almost_devoid_co_var_of_type (CastTy ty co) cv
   = almost_devoid_co_var_of_type ty cv
@@ -966,11 +1019,25 @@ visVarsOfType orig_ty = Pair invis_vars vis_vars
     invis_vars = invis_vars1 `minusVarSet` vis_vars
 
     go (TyVarTy tv)      = Pair (tyCoVarsOfType $ tyVarKind tv) (unitVarSet tv)
+    go (ClassAppTy _ inst dict operand kind) = invisible (tyCoVarsOfTypes [inst, dict, kind]) `mappend` go operand
+    go (DepDictTy v ty) = ((`delVarSet` v) <$> go ty) `mappend` invisible (tyCoVarsOfType (varType v))
+    go (TermAppTy f arg) = go (TermVarTy f) `mappend` go arg
+    go (TermVarTy v)     = scopedTermOccurrence
+                            (\i -> Pair (tyCoVarsOfType (varType i)) (unitVarSet i)) v
+    go (ExistsTy _ v ty)
+      = ((`delVarSet` v) <$> go ty) `mappend`
+        invisible (tyCoVarsOfType $ varType v)
+    go (DepFunTy _ v ty)
+      = go (idMult v) `mappend`
+        ((`delVarSet` v) <$> go ty) `mappend`
+        invisible (tyCoVarsOfType $ varType v)
     go (AppTy t1 t2)     = go t1 `mappend` go t2
     go (TyConApp tc tys) = go_tc tc tys
-    go (FunTy _ w t1 t2) = go w `mappend` go t1 `mappend` go t2
-    go (ForAllTy (Bndr tv _) ty)
-      = ((`delVarSet` tv) <$> go ty) `mappend`
+    go (FunTy _ ma w t1 t2) = invisible (tyCoVarsOfType ma) `mappend`
+                               go w `mappend` go t1 `mappend` go t2
+    go (ForAllTy ma (Bndr tv _) ty)
+      = invisible (tyCoVarsOfType ma) `mappend`
+        ((`delVarSet` tv) <$> go ty) `mappend`
         (invisible (tyCoVarsOfType $ varType tv))
     go (LitTy {}) = mempty
     go (CastTy ty co) = go ty `mappend` invisible (tyCoVarsOfCo co)
@@ -991,6 +1058,29 @@ visVarsOfTypes = foldMap visVarsOfType
 *                                                                      *
 ********************************************************************* -}
 
+{- Note [Matchability and injective variables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An application determines its function and argument only when the consumed
+kind binder is matchable. A U arrow does not permit this inversion. A forall
+keeps its existing implicit M classification in this stage.
+
+For an oversaturated TyConApp, inspect the residual kind of each application.
+The declared family prefix and its result kind have separate rules. Rebuild
+only the excess arguments as AppTy nodes, then use the same check as AppTy.
+Do not treat every excess family argument as injective. A partial synonym
+also keeps its head until saturation. For example, knowing Drop a in
+`type Drop a b = b` gives no information about a.
+
+A FunTy is a structural application of the FUN constructor. Its metadata is
+injective even when that metadata is U. This does not invert a U function's
+result.
+-}
+
+-- | Test whether an application permits inverse function and argument evidence.
+-- See Note [Matchability and injective variables].
+injectiveAppTy :: Type -> Bool
+injectiveAppTy fun = isMatchableFunTy (typeKind fun)
+
 isInjectiveInType :: TyVar -> Type -> Bool
 -- True <=> tv /definitely/ appears injectively in ty
 -- A bit more efficient that (tv `elemVarSet` injectiveTyVarsOfType ty)
@@ -1001,17 +1091,29 @@ isInjectiveInType tv ty
   where
     go ty | Just ty' <- rewriterView ty = go ty'
     go (TyVarTy tv')                    = tv' == tv
-    go (AppTy f a)                      = go f || go a
-    go (FunTy _ w ty1 ty2)              = go w || go ty1 || go ty2
+    go ClassAppTy{}                     = False
+    go DepDictTy{}                      = False
+    go (TermAppTy {})                   = False
+    go (TermVarTy v)                    = v == tv
+    go (ExistsTy {})                    = False
+    go (DepFunTy _ v ty)                  = go (idMult v) || go (varType v) || (tv /= v && go ty)
+    -- See Note [Matchability and injective variables].
+    go (AppTy f a)                      = injectiveAppTy f && (go f || go a)
+    go (FunTy _ ma w ty1 ty2)           = go ma || go w || go ty1 || go ty2
     go (TyConApp tc tys)                = go_tc tc tys
-    go (ForAllTy (Bndr tv' _) ty)       = go (tyVarKind tv')
+    go (ForAllTy ma (Bndr tv' _) ty)    = go ma || go (tyVarKind tv')
                                           || (tv /= tv' && go ty)
     go LitTy{}                          = False
     go (CastTy ty _)                    = go ty
     go CoercionTy{}                     = False
 
-    go_tc tc tys | isTypeFamilyTyCon tc = False
-                 | otherwise            = any go tys
+    -- See Note [Matchability and injective variables].
+    go_tc tc tys
+      | (args, extra@(_:_)) <- splitAt (tyConArity tc) tys
+      = go (foldl AppTy (TyConApp tc args) extra)
+      | tyConMustBeSaturated tc, tys `lengthLessThan` tyConArity tc = False
+      | isTypeFamilyTyCon tc = False
+      | otherwise           = any go tys
 
 -- | Returns the free variables of a 'Type' that are in injective positions.
 -- Specifically, it finds the free variables while:
@@ -1065,23 +1167,36 @@ inj_vars_of_type look_under_tfs = go
   where
     go ty | Just ty' <- rewriterView ty = go ty'
     go (TyVarTy v)                      = deepUnitFV (go . varType) v
-    go (AppTy f a)                      = go f `mappend` go a
-    go (FunTy _ w ty1 ty2)              = go w `mappend` go ty1 `mappend` go ty2
+    go ClassAppTy{}                     = mempty
+    go DepDictTy{}                      = mempty
+    go (TermAppTy {})                   = mempty
+    go (TermVarTy v)                    = scopedTermOccurrence (deepUnitFV (go . varType)) v
+    go (ExistsTy {})                    = mempty
+    go (DepFunTy _ v ty)                  = go (idMult v) `mappend` go (varType v) `mappend`
+                                          addBndrFV v (go ty)
+    -- See Note [Matchability and injective variables].
+    go (AppTy f a)
+      | injectiveAppTy f               = go f `mappend` go a
+      | otherwise                     = mempty
+    go (FunTy _ ma w ty1 ty2)           = go ma `mappend` go w `mappend` go ty1 `mappend` go ty2
     go (TyConApp tc tys)                = go_tc tc tys
-    go (ForAllTy (Bndr tv _) ty)        = go (tyVarKind tv) `mappend`
+    go (ForAllTy ma (Bndr tv _) ty)     = go ma `mappend` go (tyVarKind tv) `mappend`
                                           addBndrFV tv (go ty)
     go LitTy{}                          = mempty
     go (CastTy ty _)                    = go ty
     go CoercionTy{}                     = mempty
 
+    -- See Note [Matchability and injective variables].
     go_tc tc tys
+      | (args, extra@(_:_)) <- splitAt (tyConArity tc) tys
+      = go (foldl AppTy (TyConApp tc args) extra)
+      | tyConMustBeSaturated tc, tys `lengthLessThan` tyConArity tc
+      = mempty
       | isTypeFamilyTyCon tc
       = if | look_under_tfs
            , Injective flags <- tyConInjectivityInfo tc
            -> mapUnionFV go $
-              filterByList (flags ++ repeat True) tys
-                         -- Oversaturated arguments to a tycon are
-                         -- always injective, hence the repeat True
+              filterByList flags tys
            | otherwise   -- No injectivity info for this type family
            -> mempty
 
@@ -1111,14 +1226,25 @@ invisibleVarsOfType = go
     go ty                  | Just ty' <- coreView ty
                            = go ty'
     go (TyVarTy v)         = go (tyVarKind v)
+    go (ClassAppTy _ inst dict operand kind)
+      = tyCoVarsOfTypes [inst, dict, kind] `unionVarSet` go operand
+    go (DepDictTy v ty) = tyCoVarsOfType (varType v) `unionVarSet` (go ty `delVarSet` v)
+    go (TermAppTy f arg)   = go (varType f) `unionVarSet` go arg
+    go (TermVarTy v)       = go (varType v)
+    go (ExistsTy _ v ty)
+      = tyCoVarsOfType (varType v) `unionVarSet` (go ty `delVarSet` v)
+    go (DepFunTy _ v ty)
+      = tyCoVarsOfType (varType v) `unionVarSet` go (idMult v) `unionVarSet` (go ty `delVarSet` v)
     go (AppTy f a)         = go f `unionVarSet` go a
-    go (FunTy _ w ty1 ty2) = go ty1 `unionVarSet` go w `unionVarSet` go ty2
-                             -- As per #23764, order is: arg, mult, res.
+    go (FunTy _ ma w ty1 ty2)
+      = go ty1 `unionVarSet` tyCoVarsOfType ma `unionVarSet` go w `unionVarSet` go ty2
+                             -- Keep the arg, mult, res order from #23764.
     go (TyConApp tc tys)   = tyCoVarsOfTypes invisibles `unionVarSet`
                              invisibleVarsOfTypes visibles
       where (invisibles, visibles) = partitionInvisibleTypes tc tys
-    go (ForAllTy (Bndr var _) ty)
-      = tyCoVarsOfType (varType var) `unionVarSet` (go ty `delVarSet` var)
+    go (ForAllTy ma (Bndr var _) ty)
+      = tyCoVarsOfType ma `unionVarSet` tyCoVarsOfType (varType var)
+        `unionVarSet` (go ty `delVarSet` var)
     go LitTy{}             = emptyVarSet
     go (CastTy ty co)      = tyCoVarsOfCo co `unionVarSet` go ty
     go (CoercionTy co)     = tyCoVarsOfCo co
@@ -1168,9 +1294,11 @@ afvFolder :: TyCoFolder (FV (BoundVars, TyCoVar -> Bool) DM.Any)
 afvFolder = TyCoFolder { tcf_view = noView  -- See Note [Free vars and synonyms]
                        , tcf_tyvar = do_tcv
                        , tcf_covar = do_tcv
+                       , tcf_termvar = scopedTermOccurrence do_tcv
                        , tcf_hole  = do_hole
                        , tcf_lit   = const mempty
-                       , tcf_tycobinder = addBndrSelectiveFV }
+                       , tcf_tycobinder = addBndrSelectiveFV
+                       , tcf_termbinder = addBndrSelectiveFV }
   where
     -- Check the variable itself with check_fv,
     -- and check its kind (this is a deep folder)
@@ -1257,13 +1385,19 @@ tyConsOfType ty
      go :: Type -> UniqSet TyCon  -- The UniqSet does duplicate elim
      go ty | Just ty' <- coreView ty = go ty'
      go (TyVarTy {})                = emptyUniqSet
+     go (ClassAppTy _ inst dict operand kind) = tyConsOfTypes [inst, dict, operand, kind]
+     go (DepDictTy v ty) = go (varType v) `unionUniqSets` go ty
+     go (TermAppTy f arg)           = go (varType f) `unionUniqSets` go arg
+     go (TermVarTy v)               = go (varType v)
+     go (ExistsTy _ v ty)             = go (varType v) `unionUniqSets` go ty
+     go (DepFunTy _ v ty)             = go (idMult v) `unionUniqSets` go (varType v) `unionUniqSets` go ty
      go (LitTy {})                  = emptyUniqSet
      go (TyConApp tc tys)           = go_tc tc `unionUniqSets` tyConsOfTypes tys
      go (AppTy a b)                 = go a `unionUniqSets` go b
-     go (FunTy af w a b)            = go w `unionUniqSets`
+     go (FunTy af ma w a b)         = go ma `unionUniqSets` go w `unionUniqSets`
                                       go a `unionUniqSets` go b
                                       `unionUniqSets` go_tc (funTyFlagTyCon af)
-     go (ForAllTy (Bndr tv _) ty)   = go ty `unionUniqSets` go (varType tv)
+     go (ForAllTy ma (Bndr tv _) ty) = go ma `unionUniqSets` go ty `unionUniqSets` go (varType tv)
      go (CastTy ty co)              = go ty `unionUniqSets` go_co co
      go (CoercionTy co)             = go_co co
 
@@ -1271,10 +1405,12 @@ tyConsOfType ty
      go_co (GRefl _ ty mco)        = go ty `unionUniqSets` go_mco mco
      go_co (TyConAppCo _ tc args)  = go_tc tc `unionUniqSets` go_cos args
      go_co (AppCo co arg)          = go_co co `unionUniqSets` go_co arg
-     go_co (ForAllCo { fco_kind = kind_co, fco_body = co })
-                                   = go_mco kind_co `unionUniqSets` go_co co
-     go_co (FunCo { fco_mult = m, fco_arg = a, fco_res = r })
-                                   = go_co m `unionUniqSets` go_co a `unionUniqSets` go_co r
+     go_co (TermAppCo f co)        = go (varType f) `unionUniqSets` go_co co
+     go_co (DepFunCo _ _ v domain co)  = go (idMult v) `unionUniqSets` go (varType v) `unionUniqSets` go_mco domain `unionUniqSets` go_co co
+     go_co (ForAllCo { fco_ma = ma, fco_kind = kind_co, fco_body = co })
+                                   = go_co ma `unionUniqSets` go_mco kind_co `unionUniqSets` go_co co
+     go_co (FunCo { fco_ma = ma, fco_mult = m, fco_arg = a, fco_res = r })
+                                   = go_co ma `unionUniqSets` go_co m `unionUniqSets` go_co a `unionUniqSets` go_co r
      go_co (AxiomCo ax args)       = go_ax ax `unionUniqSets` go_cos args
      go_co (UnivCo { uco_lty = t1, uco_rty = t2 })
                                    = go t1 `unionUniqSets` go t2
@@ -1300,6 +1436,7 @@ tyConsOfType ty
      go_ax (UnbranchedAxiom ax) = go_tc $ coAxiomTyCon ax
      go_ax (BranchedAxiom ax _) = go_tc $ coAxiomTyCon ax
      go_ax (BuiltInFamRew  bif) = go_tc $ bifrw_fam_tc bif
+     go_ax (BuiltInRule {})     = emptyUniqSet
      go_ax (BuiltInFamInj {})   = emptyUniqSet  -- A free-floating axiom
 
 tyConsOfTypes :: [Type] -> UniqSet TyCon
@@ -1397,22 +1534,53 @@ occCheckExpand vs_to_avoid ty
       | bad_var_occ as tv               = Nothing
       | otherwise                       = return ty
 
+    go cxt (ClassAppTy f inst dict operand kind)
+      = ClassAppTy f <$> go cxt inst <*> go cxt dict <*> go cxt operand <*> go cxt kind
+    go cxt@(as, env) (DepDictTy v body)
+      = do { predicate <- go cxt (varType v)
+           ; let v' = setVarType v predicate
+           ; DepDictTy v' <$> go (as `delVarSet` v, extendVarEnv env v v') body }
+    go cxt@(as, env) (TermAppTy f arg)
+      | bad_var_occ as f = Nothing
+      | otherwise = TermAppTy (lookupVarEnv env f `orElse` f) <$> go cxt arg
+
+    go (as, env) ty@(TermVarTy v)
+      | Just v' <- lookupVarEnv env v = return (TermVarTy v')
+      | bad_var_occ as v              = Nothing
+      | otherwise                    = return ty
+
+    go cxt@(as, env) (ExistsTy flag v body)
+       = do { kind' <- go cxt (varType v)
+            ; let v' = setVarType v kind'
+            ; ExistsTy flag v' <$> go (as `delVarSet` v, extendVarEnv env v v') body }
+
+    go cxt@(as, env) (DepFunTy vis v body_ty)
+       = do { arg_ty <- go cxt (varType v)
+            ; mult_ty <- go cxt (idMult v)
+            ; let v'   = setIdMult (setVarType v arg_ty) mult_ty
+                  env' = extendVarEnv env v v'
+                  as'  = as `delVarSet` v
+            ; body' <- go (as', env') body_ty
+            ; return (mkDepFunTyWithVis vis v' body') }
+
     go _   ty@(LitTy {}) = return ty
     go cxt (AppTy ty1 ty2) = do { ty1' <- go cxt ty1
                                 ; ty2' <- go cxt ty2
                                 ; return (AppTy ty1' ty2') }
-    go cxt ty@(FunTy _ w ty1 ty2)
-       = do { w'   <- go cxt w
+    go cxt ty@(FunTy _ ma w ty1 ty2)
+       = do { ma'  <- go cxt ma
+            ; w'   <- go cxt w
             ; ty1' <- go cxt ty1
             ; ty2' <- go cxt ty2
-            ; return (ty { ft_mult = w', ft_arg = ty1', ft_res = ty2' }) }
-    go cxt@(as, env) (ForAllTy (Bndr tv vis) body_ty)
-       = do { ki' <- go cxt (varType tv)
+            ; return (ty { ft_ma = ma', ft_mult = w', ft_arg = ty1', ft_res = ty2' }) }
+    go cxt@(as, env) (ForAllTy ma (Bndr tv vis) body_ty)
+       = do { ma' <- go cxt ma
+            ; ki' <- go cxt (varType tv)
             ; let tv'  = setVarType tv ki'
                   env' = extendVarEnv env tv tv'
                   as'  = as `delVarSet` tv
             ; body' <- go (as', env') body_ty
-            ; return (ForAllTy (Bndr tv' vis) body') }
+            ; return (mkTyCoForAllTy ma' tv' vis body') }
 
     -- For a type constructor application, first try expanding away the
     -- offending variable from the arguments.  If that doesn't work, next
@@ -1472,20 +1640,36 @@ occCheckExpand vs_to_avoid ty
     go_co cxt (SubCo co)                = do { co' <- go_co cxt co
                                              ; return (SubCo co') }
 
-    go_co cxt@(as, env) co@(ForAllCo { fco_tcv = tcv, fco_kind = kind_co, fco_body = body_co })
-      = do { ki' <- go cxt (varType tcv)
+    go_co cxt@(as, env) (TermAppCo f arg_co)
+      | bad_var_occ as f = Nothing
+      | otherwise = TermAppCo (lookupVarEnv env f `orElse` f) <$> go_co cxt arg_co
+
+    go_co cxt@(as, env) (DepFunCo visL visR v domain body_co)
+      = do { arg_ty <- go cxt (varType v)
+           ; mult_ty <- go cxt (idMult v)
+           ; domain' <- go_mco cxt domain
+           ; let v' = setIdMult (setVarType v arg_ty) mult_ty
+                 env' = extendVarEnv env v v'
+                 as' = as `delVarSet` v
+           ; body' <- go_co (as', env') body_co
+           ; return (DepFunCo visL visR v' domain' body') }
+
+    go_co cxt@(as, env) co@(ForAllCo { fco_tcv = tcv, fco_ma = ma_co, fco_kind = kind_co, fco_body = body_co })
+      = do { ma_co' <- go_co cxt ma_co
+           ; ki' <- go cxt (varType tcv)
            ; let tcv' = setVarType tcv ki'
                  env' = extendVarEnv env tcv tcv'
                  as'  = as `delVarSet` tcv
            ; kind_co' <- go_mco cxt kind_co
            ; body' <- go_co (as', env') body_co
-           ; return (co { fco_tcv = tcv', fco_kind = kind_co', fco_body = body' }) }
+           ; return (co { fco_tcv = tcv', fco_ma = ma_co', fco_kind = kind_co', fco_body = body' }) }
 
-    go_co cxt co@(FunCo { fco_mult = w, fco_arg = co1 ,fco_res = co2 })
-      = do { co1' <- go_co cxt co1
+    go_co cxt co@(FunCo { fco_ma = ma, fco_mult = w, fco_arg = co1 ,fco_res = co2 })
+      = do { ma' <- go_co cxt ma
+           ; co1' <- go_co cxt co1
            ; co2' <- go_co cxt co2
            ; w' <- go_co cxt w
-           ; return (co { fco_mult = w', fco_arg = co1', fco_res = co2' })}
+           ; return (co { fco_ma = ma', fco_mult = w', fco_arg = co1', fco_res = co2' })}
 
     go_co cxt (CoVarCo c)               = CoVarCo <$> go_cv cxt c
     go_co cxt co@(HoleCo h)             = co <$ go_hole cxt h

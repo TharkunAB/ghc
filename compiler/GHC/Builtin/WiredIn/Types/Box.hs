@@ -320,6 +320,7 @@ mkWiredInNewTyCon tc_name dc_name nt_co_uniq bndrs roles nt_fld_ty =
                     , co_ax_name     = nt_co_name
                     , co_ax_tc       = tc
                     , co_ax_role     = Representational
+                    , co_ax_source_proof_rules = []
                     , co_ax_implicit = True
                     , co_ax_branches = unbranched branch }
     branch = CoAxBranch { cab_loc     = getSrcSpan nt_co_name
@@ -365,7 +366,7 @@ boxTFTyCon =
     NotInjective
   where
     binders = [ mkAnonTyConBinder runtimeRep1TyVar ]
-    kind    = mkTyConKind binders liftedTypeKind
+    kind    = mkTyConKindWithMatchability unmatchableDataConTy binders liftedTypeKind
     ops     = trivialBuiltInClosedTyFam { bctfMatchFam = [axBox] }
 
 -- | @DictBox@ boxes a (lifted) constraint into a value of kind @Type@:
@@ -503,7 +504,7 @@ listIndexTyCon =
     binders  = mkTemplateTyConBinders [liftedTypeKind]
                  (\ ~[k] -> [mkListTy k, naturalTy])
     res_kind = mkTyVarTy (head (binderVars binders))  -- k
-    kind     = mkTyConKind binders res_kind
+    kind     = mkTyConKindWithMatchability unmatchableDataConTy binders res_kind
     ops      = trivialBuiltInClosedTyFam { bctfMatchFam = [axListIndex] }
 
 -- | The type family reduction rule of the built-in @(!!)@ type family.

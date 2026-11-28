@@ -17,10 +17,14 @@ types that
 {-# LANGUAGE DerivingVia #-}
 
 module GHC.Types.Basic (
+        SourceTableOrigin(..),
         LeftOrRight(..),
         pickLR,
 
         ConTag, ConTagZ, fIRST_TAG,
+        gadtTrailingContextOnly,
+        ConSourceOrder(..), ConSourceGroup(..), legacyConOrder, conInteriorContext, conInteriorForAll,
+        foldConSourceGroups, orderedConTypeGroups,
 
         Arity, VisArity, RepArity, JoinArity, FullArgCount,
         JoinPointHood(..), isJoinPoint,
@@ -155,6 +159,67 @@ fIRST_TAG :: ConTag
 -- ^ Tags are allocated from here for real constructors
 --   or for superclass selectors
 fIRST_TAG =  1
+
+-- | Terminal constructor order for a context with no late type binders.
+-- Zero denotes the ordinary order. Positive values count late type binders.
+-- See Note [Terminal constructor type arguments] in GHC.Core.DataCon.
+gadtTrailingContextOnly :: Int
+gadtTrailingContextOnly = -1
+
+-- | Source order for a constructor's existing argument arrays.
+data ConSourceOrder
+  = LegacyConOrder !Int
+  | OrderedConArgs [ConSourceGroup]
+
+-- | Each group consumes the next arguments of its kind.
+data ConSourceGroup
+  = ConTypeArgs !Int
+  | ConContextArgs !Int
+  | ConValueArgs !Int
+  deriving Eq
+
+-- | The historical terminal binder count or context marker.
+legacyConOrder :: ConSourceOrder -> Int
+legacyConOrder (LegacyConOrder n) = n
+legacyConOrder OrderedConArgs{} = 0
+
+-- | Number of fields before the context in the interior form.
+conInteriorContext :: ConSourceOrder -> Maybe Int
+conInteriorContext (OrderedConArgs [ConTypeArgs _, ConValueArgs n, ConContextArgs _, ConValueArgs _]) = Just n
+conInteriorContext _ = Nothing
+
+-- | For each interior forall, the preceding field count and binder count.
+conInteriorForAll :: ConSourceOrder -> Maybe [(Int, Int)]
+conInteriorForAll (OrderedConArgs (ConTypeArgs _ : ConValueArgs n : ConTypeArgs m : rest))
+  = ((n, m) :) <$> go rest
+  where
+    go [ConValueArgs 1] = Just []
+    go (ConValueArgs fields : ConTypeArgs binders : gs) =
+      ((fields, binders) :) <$> go gs
+    go _ = Nothing
+conInteriorForAll _ = Nothing
+
+-- | Later type groups with the number of intervening value fields.
+orderedConTypeGroups :: [ConSourceGroup] -> [(Int, Int)]
+orderedConTypeGroups groups = go 0 (drop 1 groups)
+  where
+    go _ [] = []
+    go fields (ConValueArgs n : rest) = go (fields + n) rest
+    go fields (ConContextArgs _ : rest) = go fields rest
+    go fields (ConTypeArgs n : rest) = (fields, n) : go 0 rest
+
+-- | Consume the three arrays according to a checked source order.
+foldConSourceGroups :: ([ty] -> r -> r) -> ([ev] -> r -> r) -> ([field] -> r -> r)
+                    -> [ConSourceGroup] -> [ty] -> [ev] -> [field] -> r -> r
+foldConSourceGroups types context fields = go
+  where
+    go [] _ _ _ result = result
+    go (ConTypeArgs n : rest) ts es fs result =
+      let (group, ts') = splitAt n ts in types group (go rest ts' es fs result)
+    go (ConContextArgs n : rest) ts es fs result =
+      let (group, es') = splitAt n es in context group (go rest ts es' fs result)
+    go (ConValueArgs n : rest) ts es fs result =
+      let (group, fs') = splitAt n fs in fields group (go rest ts es fs' result)
 
 {-
 ************************************************************************
@@ -1074,9 +1139,12 @@ data UnfoldingSource
                     -- Only a few primop-like things have this property
                     -- (see "GHC.Types.Id.Make", calls to mkCompulsoryUnfolding).
                     -- Inline absolutely always, however boring the context.
+  | RetainedDefaultSrc -- A compulsory template for a checked retained default.
+  | RetainedUserSrc -- An optional template that requires the retained optimizer.
 
 isStableUserSource :: UnfoldingSource -> Bool
 isStableUserSource StableUserSrc = True
+isStableUserSource RetainedUserSrc = True
 isStableUserSource _             = False
 
 isStableSystemSource :: UnfoldingSource -> Bool
@@ -1085,23 +1153,30 @@ isStableSystemSource _               = False
 
 isCompulsorySource :: UnfoldingSource -> Bool
 isCompulsorySource CompulsorySrc = True
+isCompulsorySource RetainedDefaultSrc = True
 isCompulsorySource _             = False
 
 isStableSource :: UnfoldingSource -> Bool
 isStableSource CompulsorySrc   = True
+isStableSource RetainedDefaultSrc = True
 isStableSource StableSystemSrc = True
 isStableSource StableUserSrc   = True
+isStableSource RetainedUserSrc = True
 isStableSource VanillaSrc      = False
 
 instance NFData UnfoldingSource where
   rnf = \case
     CompulsorySrc -> ()
+    RetainedDefaultSrc -> ()
+    RetainedUserSrc -> ()
     StableUserSrc -> ()
     StableSystemSrc -> ()
     VanillaSrc -> ()
 
 instance Outputable UnfoldingSource where
   ppr CompulsorySrc     = text "Compulsory"
+  ppr RetainedDefaultSrc = text "CompulsoryRetainedDefault"
+  ppr RetainedUserSrc   = text "StableRetainedUser"
   ppr StableUserSrc     = text "StableUser"
   ppr StableSystemSrc   = text "StableSystem"
   ppr VanillaSrc        = text "<vanilla>"
@@ -1476,3 +1551,9 @@ convImportLevel NotLevelled = NormalLevel
 convImportLevelSpec :: ImportDeclLevel -> ImportLevel
 convImportLevelSpec ImportDeclQuote = QuoteLevel
 convImportLevelSpec ImportDeclSplice = SpliceLevel
+
+-- | Select the source route for a closed call with available object code.
+data SourceTableOrigin
+  = NominalSourceTable
+  | ExecutableSourceTable
+  | FinalCoreSourceTable

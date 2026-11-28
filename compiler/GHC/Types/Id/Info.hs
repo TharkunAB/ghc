@@ -14,8 +14,8 @@ Haskell. [WDP 94/11])
 
 module GHC.Types.Id.Info (
         -- * The IdDetails type
-        IdDetails(..), pprIdDetails, coVarDetails, isCoVarDetails,
-        mkDFunIdDetails,
+        IdDetails(..), pprIdDetails, coVarDetails, isCoVarDetails, isJoinIdDetails,
+        mkDFunIdDetails, SourceDFun(..), SourceLiteralNames,
         JoinArity, isJoinIdDetails_maybe,
 
         RecSelParent(..), recSelParentName, recSelFirstConName,
@@ -25,6 +25,9 @@ module GHC.Types.Id.Info (
         -- * The IdInfo type
         IdInfo,         -- Abstract
         vanillaIdInfo, noCafIdInfo,
+        sourceProofRuleInfo, setSourceProofRuleInfo,
+        inferredRetainedIdInfo, setInferredRetainedIdInfo,
+        invisibleRetainedIdInfo, setInvisibleRetainedIdInfo,
 
         -- ** The OneShotInfo type
         OneShotInfo(..),
@@ -140,6 +143,10 @@ infixl  1 `setRuleInfo`,
 data IdDetails
   = VanillaId
 
+  -- | The checked source definition and its closed family of equations.
+  -- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
+  | SourceTableId Name TyCon SourceTableOrigin
+
   -- | The 'Id' for a record selector
   | RecSelId
     { sel_tycon      :: RecSelParent
@@ -149,6 +156,8 @@ data IdDetails
                                 -- See Note [Naughty record selectors] in GHC.Tc.TyCl
     , sel_cons       :: RecSelInfo
                         -- Partiality info, cached here based on the RecSelParent.
+    , sel_sourceTable :: Maybe TyCon
+                        -- The checked equation of a generated retained witness selector.
     }
 
   | DataConWorkId DataCon       -- ^ The 'Id' is for a data constructor /worker/
@@ -191,7 +200,9 @@ data IdDetails
   | FCallId ForeignCall         -- ^ The 'Id' is for a foreign call.
                                 -- Type will be simple: no type families, newtypes, etc
 
-  | DFunId Bool                 -- ^ A dictionary function.
+  | DFunId Bool (Maybe SourceDFun) -- ^ A dictionary function.
+       -- The optional field identifies the owner and its checked methods.
+       -- See Note [Checked dictionary methods] in GHC.Types.Id.
        -- Bool = True <=> a dictionary of this class cannot be bottom
        -- See Note [NON-BOTTOM-DICTS invariant] in GHC.Core
 
@@ -220,6 +231,10 @@ data IdDetails
         -- ^ An instance method.
       Name
         -- ^ 'Name' of the dictionary function the instance method belongs to.
+
+  -- | A checked indexed closure family and the source Names of its helpers.
+  -- See Note [Certifying a checked source closure] in GHC.Tc.Gen.SourceClosure.
+  | CheckedClosureSourceTableId Name TyCon [Name]
 
 data RecSelInfo
   = RSI { rsi_def   :: [ConLike]   -- Record selector defined for these
@@ -413,6 +428,11 @@ coVarDetails :: IdDetails
 coVarDetails = CoVarId
 
 -- | Check if an 'IdDetails' says 'CoVarId'.
+-- | Test join-point details without exposing their representation.
+isJoinIdDetails :: IdDetails -> Bool
+isJoinIdDetails JoinId {} = True
+isJoinIdDetails _ = False
+
 isCoVarDetails :: IdDetails -> Bool
 isCoVarDetails CoVarId = True
 isCoVarDetails _       = False
@@ -421,8 +441,18 @@ isJoinIdDetails_maybe :: IdDetails -> Maybe (JoinArity, (Maybe [CbvMark]))
 isJoinIdDetails_maybe (JoinId join_arity marks) = Just (join_arity, marks)
 isJoinIdDetails_maybe _                   = Nothing
 
+-- | Names of the fromInteger selector and its zero and successor constructors.
+type SourceLiteralNames = (Name, Name, Name)
+
+-- | Mandatory information for a dictionary with checked source methods.
+data SourceDFun = SourceDFun
+  { sdf_owner   :: Name
+  , sdf_methods :: [(Name, Name)]
+  , sdf_literal :: Maybe SourceLiteralNames
+  }
+
 mkDFunIdDetails :: Class -> IdDetails
-mkDFunIdDetails cls = DFunId (isTerminatingTyCon (classTyCon cls))
+mkDFunIdDetails cls = DFunId (isTerminatingTyCon (classTyCon cls)) Nothing
 
 instance Outputable IdDetails where
     ppr = pprIdDetails
@@ -432,6 +462,13 @@ pprIdDetails VanillaId = empty
 pprIdDetails other     = brackets (pp other)
  where
    pp VanillaId               = panic "pprIdDetails"
+   pp (SourceTableId _ table origin) = text label <+> ppr table
+     where label = case origin of
+             NominalSourceTable -> "SourceTable"
+             ExecutableSourceTable -> "ExecutableSourceTable"
+             FinalCoreSourceTable -> "FinalCoreSourceTable"
+   pp (CheckedClosureSourceTableId _ table helpers) =
+     text "CheckedClosureSourceTable" <+> ppr table <+> ppr helpers
    pp (WorkerLikeId dmds)     = text "StrictWorker" <> parens (ppr dmds)
    pp (DataConWorkId _)       = text "DataCon"
    pp (DataConWrapId _)       = text "DataConWrapper"
@@ -439,14 +476,17 @@ pprIdDetails other     = brackets (pp other)
    pp (RepPolyId {})          = text "RepPolyId"
    pp (PrimOpId {})           = text "PrimOp"
    pp (FCallId _)             = text "ForeignCall"
-   pp (DFunId terminating)    = text "DFunId"
+   pp (DFunId terminating methods) = text "DFunId"
                                 <> ppWhen (not terminating) (text "(may-be-bottom)")
+                                <> maybe empty pp_source methods
    pp (RecSelId { sel_naughty = is_naughty })
                               = brackets $ text "RecSel" <>
                                            ppWhen is_naughty (text "(naughty)")
    pp CoVarId                 = text "CoVarId"
    pp (JoinId arity marks)    = text "JoinId" <> parens (int arity) <> parens (ppr marks)
    pp (InstMethId name)       = text "InstMethId" <> parens (ppr name)
+
+   pp_source d = parens (ppr (sdf_methods d) <+> maybe empty ppr (sdf_literal d))
 
 {-
 ************************************************************************
@@ -509,7 +549,10 @@ data IdInfo
         -- See also Note [LFInfo of DataCon workers and wrappers]
 
         -- See documentation of the getters for what these packed fields mean.
-        tagSig          :: !(Maybe TagSig)
+        tagSig          :: !(Maybe TagSig),
+        -- Checked methods used in source proofs. Keep these dependencies
+        -- when discarding optimization information.
+        sourceProofRuleInfo :: [SourceProofRule]
     }
 
 -- | Encodes arities, OneShotInfo, CafInfo.
@@ -517,9 +560,10 @@ data IdInfo
 --
 -- - Bit   0   (1):  OneShotInfo
 -- - Bit   1   (1):  CafInfo
--- - Bit   2   (1):  unused
+-- - Bit   2   (1):  InferredSpec flag on invisible retained DepFunTy binders
 -- - Bits  3-32(30): Call Arity info
 -- - Bits 33-62(30): Arity info
+-- - Bit  63   (1):  DepFunInvisible flag on retained DataCon field binders
 --
 newtype BitField = BitField Word64
 
@@ -533,6 +577,12 @@ bitfieldGetOneShotInfo (BitField bits) =
 bitfieldGetCafInfo :: BitField -> CafInfo
 bitfieldGetCafInfo (BitField bits) =
     if testBit bits 1 then NoCafRefs else MayHaveCafRefs
+
+bitfieldGetInferredRetained :: BitField -> Bool
+bitfieldGetInferredRetained (BitField bits) = testBit bits 2
+
+bitfieldGetInvisibleRetained :: BitField -> Bool
+bitfieldGetInvisibleRetained (BitField bits) = testBit bits 63
 
 bitfieldGetCallArityInfo :: BitField -> ArityInfo
 bitfieldGetCallArityInfo (BitField bits) =
@@ -553,6 +603,14 @@ bitfieldSetCafInfo info (BitField bits) =
     case info of
       MayHaveCafRefs -> BitField (clearBit bits 1)
       NoCafRefs -> BitField (setBit bits 1)
+
+bitfieldSetInferredRetained :: Bool -> BitField -> BitField
+bitfieldSetInferredRetained flag (BitField bits) =
+    if flag then BitField (setBit bits 2) else BitField (clearBit bits 2)
+
+bitfieldSetInvisibleRetained :: Bool -> BitField -> BitField
+bitfieldSetInvisibleRetained flag (BitField bits) =
+    if flag then BitField (setBit bits 63) else BitField (clearBit bits 63)
 
 bitfieldSetCallArityInfo :: ArityInfo -> BitField -> BitField
 bitfieldSetCallArityInfo info bf@(BitField bits) =
@@ -661,6 +719,28 @@ setDmdSigInfo info dd = dd `seq` info { dmdSigInfo = dd }
 setCprSigInfo :: IdInfo -> CprSig -> IdInfo
 setCprSigInfo info cpr = cpr `seq` info { cprSigInfo = cpr }
 
+-- | Retain the dependencies of checked source evidence on this export.
+setSourceProofRuleInfo :: IdInfo -> [SourceProofRule] -> IdInfo
+setSourceProofRuleInfo info deps = info { sourceProofRuleInfo = deps }
+
+-- | Test whether an invisible retained 'DepFunTy' binder has 'InferredSpec'.
+inferredRetainedIdInfo :: IdInfo -> Bool
+inferredRetainedIdInfo = bitfieldGetInferredRetained . bitfield
+
+-- | Record whether an invisible retained 'DepFunTy' binder has 'InferredSpec'.
+setInferredRetainedIdInfo :: Bool -> IdInfo -> IdInfo
+setInferredRetainedIdInfo flag info =
+    info { bitfield = bitfieldSetInferredRetained flag (bitfield info) }
+
+-- | Test whether a retained constructor field binder has 'DepFunInvisible' visibility.
+invisibleRetainedIdInfo :: IdInfo -> Bool
+invisibleRetainedIdInfo = bitfieldGetInvisibleRetained . bitfield
+
+-- | Record whether a retained constructor field binder has 'DepFunInvisible' visibility.
+setInvisibleRetainedIdInfo :: Bool -> IdInfo -> IdInfo
+setInvisibleRetainedIdInfo flag info =
+    info { bitfield = bitfieldSetInvisibleRetained flag (bitfield info) }
+
 -- | Basic 'IdInfo' that carries no useful information whatsoever
 vanillaIdInfo :: IdInfo
 vanillaIdInfo
@@ -678,7 +758,8 @@ vanillaIdInfo
                              bitfieldSetOneShotInfo NoOneShotInfo $
                              emptyBitField,
             lfInfo         = Nothing,
-            tagSig         = Nothing
+            tagSig         = Nothing,
+            sourceProofRuleInfo = []
            }
 
 -- | More informative 'IdInfo' we can use when we know the 'Id' has no CAF references

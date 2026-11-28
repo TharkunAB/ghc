@@ -381,8 +381,8 @@ mkDictSelId name clas
 
     pred_ty = mkClassPred clas (mkTyVarTys (binderVars tyvars))
     res_ty  = scaledThing (getNth arg_tys val_index)
-    sel_ty  = mkForAllTys tyvars $
-              mkFunctionType ManyTy pred_ty res_ty
+    sel_ty  = mkForAllTys [(unmatchableDataConTy, tv) | tv <- tyvars] $
+              mkFunctionType unmatchableDataConTy ManyTy pred_ty res_ty
              -- See Note [Type classes and linear types]
 
     terminating = isTerminatingType res_ty || definitelyUnliftedType res_ty
@@ -742,11 +742,36 @@ mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con
   = return (NoDataConRep, arg_ibangs, rep_strs)
 
   | otherwise
-  = do { wrap_args <- mapM (newLocal (fsLit "conrep")) wrap_arg_tys
-       ; wrap_body <- mk_rep_app (dropList stupid_theta wrap_args `zip` dropList eq_spec unboxers)
-                                 initial_wrap_app
-                        -- Drop the stupid theta arguments, as per
-                        -- Note [Instantiating stupid theta] in GHC.Core.DataCon.
+  = do { (wrap_args, wrap_body) <-
+           if retained_result
+             then do { args <- sequence
+                        [maybe (newLocal (fsLit "conrep") ty) pure mb
+                        | (mb, ty) <- zipEqual (dataConRepArgBinders data_con) wrap_arg_tys]
+                     -- Reuse the retained Id in the result and in reflexivity.
+                     -- See Note [Retained constructor result equality] in GHC.Core.DataCon.
+                     ; return (args, mkCoApps (mkVarApps initial_wrap_app args) refls) }
+             else if not (null (dataConRepArgBinders data_con))
+               then do { let mb_binders = replicate (length (stupid_theta ++ theta)) Nothing
+                                          ++ dataConRepArgBinders data_con
+                       ; args <- sequence
+                           [ maybe (newLocal (fsLit "conrep") ty) pure mb
+                           | (mb, ty) <- zipEqual mb_binders wrap_arg_tys ]
+                       ; let explicit_args = dropList stupid_theta args
+                       ; body <- mk_rep_app (explicit_args `zip` dropList eq_tys unboxers)
+                                            (mkCoApps initial_wrap_app refls)
+                       ; return (args, body) }
+             else do { args <- mapM (newLocal (fsLit "conrep")) wrap_arg_tys
+                     ; let explicit_args = dropList stupid_theta args
+                     ; body <- case explicit_args of
+                         [field] | new_tycon, not omit_newtype_arg
+                                 , not (isFixedRuntimeRepKind (tyConResKind tycon))
+                                 , null theta, null eq_spec, null source_exs
+                           -> return (wrapNewTypeBody tycon res_ty_args (Var field))
+                         _ -> mk_rep_app (explicit_args `zip` dropList eq_tys unboxers)
+                                         (mkCoApps initial_wrap_app refls)
+                     ; return (args, body) }
+           -- Drop the stupid theta arguments, as per
+           -- Note [Instantiating stupid theta] in GHC.Core.DataCon.
 
        ; let wrap_id = mkGlobalId (DataConWrapId data_con) wrap_name wrap_ty wrap_info
              wrap_info = noCafIdInfo
@@ -773,11 +798,18 @@ mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con
                | otherwise        = LFReEntrant TopLevel (countFunRepArgs wrap_arity wrap_ty) True ArgUnknown
                                                       -- LFInfo stores post-unarisation arity
 
-             wrap_arg_dmds =
-               replicate (length stupid_theta + length theta) topDmd
-                 ++ map mk_dmd arg_ibangs
-               -- Don't forget the dictionary arguments when building
-               -- the strictness signature (#14290, #26748).
+             wrap_arg_dmds
+               | OrderedConArgs groups <- dataConSourceOrder data_con
+               = replicate (length stupid_theta) topDmd ++
+                 foldConSourceGroups (const id) (++) (++) groups ([] :: [()]) dict_dmds field_dmds []
+               | Just n <- dataConContextFieldCount data_con
+               , (prefix, suffix) <- splitAt n field_dmds
+               = prefix ++ dict_dmds ++ suffix
+               | otherwise = dict_dmds ++ field_dmds
+               where
+                 field_dmds = map mk_dmd arg_ibangs
+                 dict_dmds = replicate (length stupid_theta + length theta) topDmd
+               -- Keep dictionary demands in wrapper order (#14290, #26748).
 
              mk_dmd str | isBanged str = evalDmd
                         | otherwise    = topDmd
@@ -803,10 +835,22 @@ mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con
                         -- See Note [Compulsory newtype unfolding], which applies to
                         -- every constructor without a binding ('dataConHasNoBinding')
                       | otherwise  = mkDataConUnfolding wrap_rhs
-             wrap_rhs = mkCoreTyLams wrap_tvbs $
-                        mkCoreLams wrap_args $
-                        wrapFamInstBody tycon res_ty_args non_wrap_arg_ty $
-                        wrap_body
+             wrap_rhs = wrap_lams (wrapFamInstBody tycon res_ty_args non_wrap_arg_ty wrap_body)
+             wrap_lams body
+               | OrderedConArgs groups <- dataConSourceOrder data_con
+               , (dict_args, field_args) <- splitAt (length theta) wrap_args
+               = foldConSourceGroups mkCoreTyLams mkCoreLams mkCoreLams
+                   groups (early_tvbs ++ late_tvbs) dict_args field_args body
+               | Just n <- dataConContextFieldCount data_con
+               , (dict_args, field_args) <- splitAt (length theta) wrap_args
+               , (prefix, suffix) <- splitAt n field_args
+               = mkCoreTyLams early_tvbs $
+                 mkCoreLams prefix $
+                 mkCoreTyLams late_tvbs $
+                 mkCoreLams dict_args $
+                 mkCoreLams suffix body
+               | otherwise = mkCoreTyLams early_tvbs $
+                 mkCoreLams wrap_args (mkCoreTyLams late_tvbs body)
 
        ; return (DCR { dcr_wrap_id = wrap_id
                      , dcr_boxer   = mk_boxer boxers
@@ -814,39 +858,55 @@ mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con
                 , arg_ibangs, rep_strs) }
 
   where
-    (univ_tvs, ex_tvs, eq_spec, theta, orig_arg_tys, _orig_res_ty)
+    (univ_tvs, source_exs, eq_spec, theta, orig_arg_tys, _orig_res_ty)
                  = dataConFullSig data_con
+    ex_tvs = dataConExTyCoVars data_con
+    gadt_proof = dataConGadtProof_maybe data_con
     stupid_theta = dataConStupidTheta data_con
-    wrap_tvbs    = dataConUserTyVarBinders data_con
+    (early_tvbs, late_tvbs) = dataConUserTyVarGroups data_con
     res_ty_args  = dataConResRepTyArgs data_con
 
     tycon        = dataConTyCon data_con       -- The representation TyCon (not family)
     wrap_ty      = dataConWrapperType data_con
-    ev_tys       = eqSpecPreds eq_spec ++ theta
-    all_arg_tys  = map unrestricted ev_tys ++ orig_arg_tys
+    eq_tys       = case gadt_proof of
+                     Just (_, index_preds) -> index_preds
+                     Nothing -> eqSpecPreds eq_spec
+    ev_tys       = eq_tys ++ theta
+    retained_result = dataConHasRetainedResult data_con
+    all_arg_tys
+      | retained_result = orig_arg_tys ++ map unrestricted ev_tys
+      | otherwise = map unrestricted ev_tys ++ orig_arg_tys
     ev_ibangs    = map (const HsLazy) ev_tys
     orig_bangs   = dataConSrcBangs data_con
 
     wrap_arg_tys
-      | new_tycon
+      | omit_newtype_arg
       -- See Wrinkle [Unlifted newtypes with wrappers]
       -- in Note [Desugaring unlifted newtypes] in GHC.Core.SimpleOpt.
       = map unrestricted stupid_theta
       | otherwise
       = (map unrestricted $ stupid_theta ++ theta) ++ orig_arg_tys
     non_wrap_arg_ty
-      | new_tycon
+      | omit_newtype_arg
       , [arg_ty] <- map unrestricted theta ++ orig_arg_tys
       = Just arg_ty
       | otherwise
       = Nothing
 
-    wrap_arity   = count isCoVar ex_tvs + length wrap_arg_tys
+    wrap_arity   = count isCoVar source_exs + length wrap_arg_tys
              -- The wrap_args are the arguments *other than* the eq_spec
              -- Because we are going to apply the eq_spec args manually in the
              -- wrapper
 
     new_tycon = isNewTyCon tycon
+
+    -- Ordered newtypes bind the field before the late type arguments.
+    -- Cast that field directly. A nested worker call would be simplified
+    -- before the caller's cast fixes the field's runtime representation.
+    -- See Note [Desugaring unlifted newtypes] in GHC.Core.SimpleOpt.
+    omit_newtype_arg = new_tycon && case dataConSourceOrder data_con of
+      LegacyConOrder _ -> True
+      OrderedConArgs _ -> False
 
     no_binding = dataConHasNoBinding data_con
 
@@ -863,7 +923,9 @@ mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con
           FixedBangOpts bangs   -> bangs
 
     (rep_tys_w_strs, wrappers)
-      = unzip (zipWith (dataConArgRep platform) all_arg_tys (ev_ibangs ++ arg_ibangs))
+      = unzip (zipWith (dataConArgRep platform) all_arg_tys all_ibangs)
+    all_ibangs | retained_result = arg_ibangs ++ ev_ibangs
+               | otherwise = ev_ibangs ++ arg_ibangs
 
     (unboxers, boxers) = unzip wrappers
     (rep_tys, rep_strs) = unzip (concat rep_tys_w_strs)
@@ -883,6 +945,7 @@ mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con
       | isUnaryClassTyCon tycon   -- See (UCM8) in Note [Unary class magic]
       = False                     -- in GHC.Core.TyCon
 
+      | retained_result = True
       | otherwise
       = (not new_tycon
                      -- (Most) newtypes have only a worker, with the exception
@@ -910,14 +973,14 @@ mkDataConRep platform dc_bang_opts fam_envs wrap_name data_con
 
     initial_wrap_app = Var (dataConWorkId data_con)
                        `mkTyApps`  res_ty_args
-                       `mkVarApps` ex_tvs
-                       `mkCoApps`  map (mkReflCo Nominal . eqSpecType) eq_spec
+                       `mkVarApps` source_exs
+    refls = map (mkReflCo Nominal . eqSpecType) eq_spec
 
     mk_boxer :: [Boxer] -> DataConBoxer
     mk_boxer boxers = DCB (\ ty_args src_vars ->
                       do { let (ex_vars, term_vars) = splitAtList ex_tvs src_vars
                                subst1 = zipTvSubst univ_tvs ty_args
-                               subst2 = foldl2 extendTvSubstWithClone subst1 ex_tvs ex_vars
+                               subst2 = foldl2 extendTCvSubstWithClone subst1 ex_tvs ex_vars
                          ; (rep_ids, binds) <- go subst2 boxers term_vars
                          ; return (ex_vars ++ rep_ids, binds) } )
 
@@ -1594,6 +1657,7 @@ unpackable_type_datacons ty
       -- check for that case
   , Just cons <- tyConDataCons_maybe tc
   , unpackable_cons cons
+  , all (null . dataConRepArgBinders) cons
   = Just cons
   | otherwise
   = Nothing
@@ -1617,6 +1681,11 @@ Note [Unpacking GADTs and existentials]
 Can we unpack a value of an algebraic data type T? For example
    data D a = MkD {-# UNPACK #-} (T a)
 Can we unpack that (T a) field?
+
+The unpacked representation has independent fields. A retained field
+can bind a variable used in the type of a later field. Keep this
+telescope boxed so the later types retain that scope. This applies to
+both products and sums.
 
 Three cases to consider in `unpackable_cons`
 
@@ -1828,7 +1897,7 @@ wrapFamInstBody tycon args mb_fun_arg body
           let af = case typeTypeOrConstraint ty of
                      TypeLike -> FTF_T_T
                      ConstraintLike -> FTF_C_T
-          in mkFunCo Representational af (mkNomReflCo m) (mkRepReflCo ty)
+          in mkFunCo Representational af (mkNomReflCo unmatchableDataConTy) (mkNomReflCo m) (mkRepReflCo ty)
 
 {-
 ************************************************************************
@@ -1865,7 +1934,7 @@ mkFCallId uniq fcall ty
            `setDmdSigInfo` strict_sig
            `setCprSigInfo` topCprSig
 
-    (bndrs, _) = tcSplitPiTys ty
+    (_, bndrs, _) = tcSplitPiTys ty
     arity      = count isAnonPiTyBinder bndrs
     strict_sig = mkVanillaDmdSig arity topDiv
     -- the call does not claim to be strict in its arguments, since they

@@ -47,6 +47,9 @@ module GHC.Types.Id (
         idName, idType, idMult, idScaledType, idUnique, idInfo, idDetails,
         recordSelectorTyCon,
         recordSelectorTyCon_maybe,
+        sourceTableId_maybe, sourceTableKeepsExecutable, sourceMethodAliases, sourceMethodTarget_maybe,
+        setSourceMethodIds, setSourceLiteralCons, sourceLiteralCons_maybe, sourceDFunDetails_maybe,
+        sourceMethodDFunClass,
 
         -- ** Modifying an Id
         setIdName, setIdUnique, GHC.Types.Id.setIdType, setIdMult,
@@ -131,6 +134,7 @@ import GHC.Prelude
 
 import GHC.Types.Id.Info
 import GHC.Types.Basic
+import GHC.Types.FieldLabel (flSelector)
 
 -- Imported and re-exported
 import GHC.Types.Var( Id, CoVar, JoinId,
@@ -145,7 +149,12 @@ import GHC.Core ( CoreExpr, CoreRule, Unfolding(..), IdUnfoldingFun
                 , isStableUnfolding, isCompulsoryUnfolding, isEvaldUnfolding
                 , hasSomeUnfolding, noUnfolding, evaldUnfolding )
 import GHC.Core.Type
-import GHC.Core.Predicate( isCoVarType )
+import GHC.Core.TyCo.Compare (eqType)
+import GHC.Types.Var (VarBndr(..), ForAllTyFlag(..), isTyVar)
+import GHC.Core.Coercion.Axiom (ClosedTyFam(CTF, CTF_Scoped))
+import GHC.Core.TyCon (TyCon, closedTypeFamily_maybe, isTerminatingTyCon,
+                       isGadtSyntaxTyCon, tyConDataCons, tyConName)
+import GHC.Core.Predicate( getClassPredTys_maybe, isCoVarType )
 import GHC.Core.DataCon
 import GHC.Core.Class
 import GHC.Core.Multiplicity
@@ -158,6 +167,7 @@ import GHC.Types.Name
 import GHC.Types.ForeignCall
 import GHC.Types.SrcLoc
 import GHC.Types.Unique
+import GHC.Types.Unique.Set (mkUniqSet, sizeUniqSet)
 import GHC.Types.Unique.Supply
 
 import GHC.Stg.EnforceEpt.TagSig
@@ -165,6 +175,7 @@ import GHC.Stg.EnforceEpt.TagSig
 import GHC.Unit.Module
 import {-# SOURCE #-} GHC.Builtin.PrimOps (PrimOp)
 import GHC.Builtin.Uniques (mkBuiltinUnique)
+import GHC.Builtin.KnownKeys (numClassKey)
 
 import GHC.Data.Maybe
 import GHC.Data.FastString
@@ -203,6 +214,159 @@ infixl  1 `setIdUnfolding`,
 
 idName   :: Id -> Name
 idName    = Var.varName
+
+-- | Recover the actual closed family for this checked top-level function.
+-- See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
+sourceTableId_maybe :: Id -> Maybe TyCon
+sourceTableId_maybe fun
+  | Just (owner, table) <- case idDetails fun of
+        SourceTableId name tbl _ -> Just (name, tbl)
+        CheckedClosureSourceTableId name tbl _ -> Just (name, tbl)
+        RecSelId{sel_fieldLabel = field, sel_sourceTable = Just tbl}
+          -> Just (flSelector field, tbl)
+        _ -> Nothing
+  , owner == idName fun
+  , Just mod <- nameModule_maybe owner
+  , nameModule_maybe (tyConName table) == Just mod
+  , nameOccName (tyConName table) == mkSourceTableOcc (nameOccName owner)
+  , Just ctf <- closedTypeFamily_maybe table
+  , case ctf of { CTF _ -> True; CTF_Scoped {} -> True; _ -> False }
+  = Just table
+  | otherwise = Nothing
+
+-- | Test the origin of an already validated source table owner.
+sourceTableKeepsExecutable :: Id -> Bool
+sourceTableKeepsExecutable fun = case idDetails fun of
+  SourceTableId _ _ ExecutableSourceTable -> True
+  _ -> False
+
+-- | Record methods whose checked bodies select a certified source function.
+-- See Note [Checked dictionary methods].
+setSourceMethodIds :: Id -> [(Id, Id)] -> Id
+setSourceMethodIds dfun methods =
+  setSourceDFun dfun aliases (sdf_literal =<< ownedSourceDFun dfun)
+  where
+    names = [(idName sel, idName target) | (sel, target) <- methods]
+    aliases | Just cls <- sourceMethodDFunClass (idType dfun)
+            , all (isJust . sourceTableId_maybe . snd) methods
+            , validSourceMethods cls names = names
+            | otherwise = []
+
+-- | Record a verified fromInteger field using its actual constructors.
+setSourceLiteralCons :: Id -> Maybe (Id, DataCon, DataCon) -> Id
+setSourceLiteralCons dfun candidate = setSourceDFun dfun (sourceMethodAliases dfun) literal
+  where
+    literal = do
+      (sel, zero, succ_con) <- candidate
+      let names = (idName sel, dataConName zero, dataConName succ_con)
+      _ <- sourceLiteralCons (idType dfun) names
+      return names
+
+-- | Install the two independent kinds of evidence on the original dictionary.
+setSourceDFun :: Id -> [(Name, Name)] -> Maybe SourceLiteralNames -> Id
+setSourceDFun dfun methods literal
+  | DFunId terminating _ <- idDetails dfun =
+      setIdDetails dfun (fromMaybe (DFunId terminating Nothing)
+               (sourceDFunDetails_maybe (idName dfun) (idType dfun) methods literal))
+  | otherwise = dfun
+
+-- | Check mandatory evidence from a producer or an imported DFun declaration.
+sourceDFunDetails_maybe :: Name -> Type -> [(Name, Name)] -> Maybe SourceLiteralNames -> Maybe IdDetails
+sourceDFunDetails_maybe owner ty methods literal
+  | isExternalName owner, not (null methods) || isJust literal
+  , Just cls <- sourceMethodDFunClass ty
+  , validSourceMethods cls methods
+  , all (isJust . sourceLiteralCons ty) literal
+  = Just (DFunId (isTerminatingTyCon (classTyCon cls)) (Just (SourceDFun owner methods literal)))
+  | otherwise = Nothing
+
+-- | Read the class of a closed, context-free DFun with erased type parameters.
+sourceMethodDFunClass :: Type -> Maybe Class
+sourceMethodDFunClass ty
+  | noFreeVarsOfType ty
+  , let (binders, body) = splitForAllForAllTyBinders ty
+  , all ordinary binders
+  = fst <$> getClassPredTys_maybe body
+  | otherwise = Nothing
+  where
+    ordinary (ma, Bndr v (Invisible _)) =
+      isTyVar v && ma `eqType` defaultForAllMatchability TypeLevel
+    ordinary _ = False
+
+validSourceMethods :: Class -> [(Name, Name)] -> Bool
+validSourceMethods cls methods =
+  all (`elem` map idName (classMethods cls)) selectors &&
+  all (isExternalName . snd) methods &&
+  length selectors == sizeUniqSet (mkUniqSet selectors)
+  where selectors = map fst methods
+
+ownedSourceDFun :: Id -> Maybe SourceDFun
+ownedSourceDFun dfun
+  | DFunId _ info@(Just source) <- idDetails dfun
+  , idName dfun == sdf_owner source = info
+  | otherwise = Nothing
+
+-- | Return the checked aliases on this exact dictionary binder.
+sourceMethodAliases :: Id -> [(Name, Name)]
+sourceMethodAliases = maybe [] sdf_methods . ownedSourceDFun
+
+-- | Find the constructor interpretation of the exact selector and ground DFun.
+sourceLiteralCons_maybe :: Id -> Id -> Maybe (DataCon, DataCon)
+sourceLiteralCons_maybe dfun selector
+  | Just cls <- isClassOpId_maybe selector, cls `hasKey` numClassKey
+  , Just names@(sel, _, _) <- sdf_literal =<< ownedSourceDFun dfun
+  , idName selector == sel = sourceLiteralCons (idType dfun) names
+  | otherwise = Nothing
+
+-- | Reconstruct the checked Peano shape from the dictionary result type.
+-- See Note [Checked dictionary methods].
+sourceLiteralCons :: Type -> SourceLiteralNames -> Maybe (DataCon, DataCon)
+sourceLiteralCons ty (sel, zero_name, succ_name)
+  | Just (cls, [target]) <- getClassPredTys_maybe ty, cls `hasKey` numClassKey
+  , nameOccName sel == mkVarOcc "fromInteger", sel `elem` map idName (classMethods cls)
+  , Just (tc, []) <- splitTyConApp_maybe target, isNativeIndexType target
+  , not (isGadtSyntaxTyCon tc)
+  , [c1, c2] <- tyConDataCons tc
+  , let (zero, succ_con) = if zero_name == dataConName c1 then (c1, c2) else (c2, c1)
+  , zero_name == dataConName zero, succ_name == dataConName succ_con
+  , [] <- dataConOrigArgTys zero, [Scaled _ field] <- dataConOrigArgTys succ_con
+  , [HsLazy] <- dataConImplBangs succ_con
+  , Just (field_tc, []) <- splitTyConApp_maybe field, field_tc == tc
+  = Just (zero, succ_con)
+  | otherwise = Nothing
+
+-- | Look up the runtime target for a selector and its exact dictionary.
+sourceMethodTarget_maybe :: Id -> Id -> Maybe Name
+sourceMethodTarget_maybe dfun selector
+  | Just cls <- sourceMethodDFunClass (idType dfun)
+  , isClassOpId_maybe selector == Just cls
+  = lookup (idName selector) (sourceMethodAliases dfun)
+  | otherwise = Nothing
+
+{- Note [Checked dictionary methods]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A class selector gets its implementation from its dictionary. A retained
+call can use the equations of another function when the checked instance
+method is an alias for that function. Keep the alias on the DFun, using
+the actual selector and target Names. A polymorphic DFun passes its
+erased parameters to the worker in order. A different dictionary for
+the same class can select a different implementation.
+
+GHC ordinarily selects the field with a DFun unfolding. See
+Note [ClassOp/DFun selection] in GHC.Tc.TyCl.Instance. The DFun's
+interface declaration records the pairs even when unfoldings are omitted. Its fingerprint depends on both Names. The target Id's own
+fingerprint depends on its checked family. Reconstruct the owner from the
+interface binder. Do not serialize a reference from the DFun to itself.
+A specialized or renamed binder must not inherit the original evidence.
+See Note [Certifying source equations from Core] in GHC.Tc.Gen.SourceTable.
+
+A checked fromInteger method can supply the constructors for a nonnegative
+source literal. Record its selector and both constructors by Name. Recover
+them from the ground dictionary type and check their field types and demand
+before using either constructor. An ordinary method alias says nothing about
+fromInteger. Store the two certificates independently (GHC Proposal #378, §4.6;
+Gundry, 2013, §5.2).
+-}
 
 idUnique :: Id -> Unique
 idUnique  = Var.varUnique

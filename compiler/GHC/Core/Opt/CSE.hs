@@ -4,18 +4,22 @@
 \section{Common subexpression}
 -}
 
-module GHC.Core.Opt.CSE (cseProgram, cseOneExpr) where
+module GHC.Core.Opt.CSE (cseProgram, cseProgramWithMode, cseOneExpr) where
 
 import GHC.Prelude
 
+import GHC.Core.Dependent ( hasScopedDictionaryExpr, hasScopedDictionaryProgram )
 import GHC.Core.Subst
+import GHC.Core.Opt.OccurAnal ( SimplCoreMode(..) )
+import GHC.Core.TyCo.Rep ( Type(DepDictTy, DepFunTy, TermVarTy) )
 import GHC.Types.Var.Env ( mkInScopeSet, mkInScopeSetList )
 import GHC.Types.Id
-import GHC.Core.Utils   ( mkAltExpr
+import GHC.Core.Utils   ( exprType, mkAltExpr
                         , exprIsTickedString
                         , stripTicksE, stripTicksT, mkTicks )
 import GHC.Core.FVs     ( exprFreeVars )
-import GHC.Core.Type    ( tyConAppArgs )
+import GHC.Core.Type    ( coreFullView, tyConAppArgs, isNativeOpaqueValueId, isNativeClassDictionaryId
+                        , isNativeIndexFunctionId )
 import GHC.Core
 import GHC.Utils.Outputable
 import GHC.Types.Basic
@@ -26,6 +30,7 @@ import GHC.Utils.Misc   ( filterOut, equalLength )
 import GHC.Utils.Panic
 import Data.Functor.Identity ( Identity (..) )
 import Data.List        ( mapAccumL )
+import Data.Maybe       ( isJust )
 
 {-
                         Simple common sub-expression
@@ -379,11 +384,16 @@ body/rest of the module.
 ************************************************************************
 -}
 
+-- | Eliminate common subexpressions in a program that may contain retained indices.
 cseProgram :: CoreProgram -> CoreProgram
-cseProgram binds
+cseProgram = cseProgramWithMode RetainedCore
+
+-- | Use the pipeline's Core mode to avoid inspecting application types in ordinary modules.
+cseProgramWithMode :: SimplCoreMode -> CoreProgram -> CoreProgram
+cseProgramWithMode mode binds
   = snd (mapAccumL (cseBind TopLevel) init_env binds)
   where
-    init_env  = emptyCSEnv $
+    init_env  = emptyCSEnv mode (mode == RetainedCore && hasScopedDictionaryProgram binds) $
                 mkInScopeSetList (bindersOfBinds binds)
                 -- Put all top-level binders into scope; it is possible to have
                 -- forward references.  See Note [Glomming] in GHC.Core.Opt.OccurAnal
@@ -704,14 +714,30 @@ try_for_cse env expr
 cseOneExpr :: InExpr -> OutExpr
 cseOneExpr e = cseExpr env e
   where
-    env = emptyCSEnv (mkInScopeSet (exprFreeVars e))
+    env = emptyCSEnv RetainedCore (hasScopedDictionaryExpr e) (mkInScopeSet (exprFreeVars e))
 
 cseExpr :: CSEnv -> InExpr -> OutExpr
 cseExpr env (Type t)              = Type (substTyUnchecked (csEnvSubst env) t)
 cseExpr env (Coercion c)          = Coercion (substCo (csEnvSubst env) c)
 cseExpr _   (Lit lit)             = Lit lit
 cseExpr env (Var v)               = lookupSubst env v
-cseExpr env (App f a)             = App (cseExpr env f) (tryForCSE env a)
+cseExpr env (App f a)
+  | cs_mode env == RetainedCore
+  , case coreFullView (exprType f) of
+      DepFunTy{} -> True
+      DepDictTy{} -> True
+      _ -> False
+  = App (cseExpr env f) (substExpr (csEnvSubst env) a)
+    -- See Note [CSE for retained operands and case evidence]
+  | otherwise = App (cseExpr env f) (tryForCSE env a)
+cseExpr env (Pack schema witness payload)
+  = Pack (substTyUnchecked subst schema) (substTyUnchecked subst witness) (tryForCSE env payload)
+  where subst = csEnvSubst env
+cseExpr env (Unpack witness payload package body)
+  = Unpack witness' payload' (tryForCSE env package) (cseExpr body_env body)
+  where
+    (witness_env, witness') = addBinder env witness
+    (body_env, payload') = addBinder witness_env payload
 cseExpr env (Tick t e)            = Tick t (cseExpr env e)
 cseExpr env (Cast e co)           = Cast (tryForCSE env e) (substCo (csEnvSubst env) co)
 cseExpr env (Lam b e)             = let (env', b') = addBinder env b
@@ -722,6 +748,11 @@ cseExpr env (Case e bndr ty alts) = cseCase env e bndr ty alts
 
 cseCase :: CSEnv -> InExpr -> InId -> InType -> [InAlt] -> OutExpr
 cseCase env scrut bndr ty alts
+  | cs_mode env == RetainedCore
+  , any (\alt -> isNativeIndexAliasAlt alt || isNativeIndexAlt alt) alts
+  = Case (substExpr (csEnvSubst env) scrut) bndr2 ty' (map (cse_rhs env1) alts)
+    -- See Note [CSE for retained operands and case evidence]
+  | otherwise
   = Case scrut1 bndr3 ty' $
     combineAlts (map cse_alt alts)
   where
@@ -750,10 +781,51 @@ cseCase env scrut bndr ty alts
           new_env       = extendCSEnv env' con_expr con_target
           con_expr      = mkAltExpr (DataAlt con) args' arg_tys
 
-    cse_alt (Alt con args rhs)
+    cse_alt alt = cse_rhs alt_env alt
+
+    cse_rhs rhs_env (Alt con args rhs)
         = Alt con args' (tryForCSE env' rhs)
         where
-          (env', args') = addBinders alt_env args
+          (env', args') = addBinders rhs_env args
+
+{- Note [CSE for retained operands and case evidence]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose use takes a retained n followed by a Vec Int n. Given x = S Z,
+CSE can usually replace S Z with x. In use (S Z) xs this replacement
+makes the second argument require Vec Int x. A binding for x does not
+supply the nominal equality x ~# S Z. Apply the current substitution
+to the retained operand and keep its index expression.
+
+The forward substitution must also preserve an index. For example, given
+let pair = importedPair in second pair, the local pair can occur in the
+result type of second. An imported value has no local index identity.
+Keep the local binding when its replacement cannot occur in that type.
+A variable used as an index function needs another eligible function head.
+
+A scoped class selector stores its receiver as a variable. In a module
+with such a selector, keep a local variable if its replacement denotes
+a constructor index. For example, replacing x by True in ordering x
+would discard the variable required by the selector. Apply the forward
+substitution to a scoped dictionary argument, as for a retained operand.
+The evidence must also be a local dictionary variable. For a concrete
+instance imported from another module, keep the local binding that
+refers to its global dictionary.
+
+The same constraint applies to a nested case on the same call:
+
+    case f n of x { DEFAULT (co1 :: x ~# f n) ->
+    case f n of y { DEFAULT (co2 :: y ~# f n) -> ... } }
+
+Replacing the inner scrutinee with x changes the proof required at co2
+to y ~# x. The reverse CSE map supplies a value, but no coercion to
+transport co2. Apply the in-scope substitution to the scrutinee and the
+branch binders together. Run CSE on each RHS in that scope.
+
+A constructor alternative can also bind a virtual proof after the
+constructor fields. Keep its telescope intact: mkAltExpr expects only
+constructor arguments, and combineAlts can discard the proof binder.
+See Note [Native index alias evidence] in GHC.Core.Lint.
+-}
 
 combineAlts :: [OutAlt] -> [OutAlt]
 -- See Note [Combine case alternatives]
@@ -855,7 +927,9 @@ the case binder is alive; see Note [DataAlt occ info] in GHC.Core.Opt.Simplify.
 -}
 
 data CSEnv
-  = CS { cs_subst :: Subst  -- Maps InBndrs to OutExprs
+  = CS { cs_mode :: !SimplCoreMode
+       , cs_scoped_dicts :: Bool
+       , cs_subst :: Subst  -- Maps InBndrs to OutExprs
             -- The substitution variables to
             -- /trivial/ OutExprs, not arbitrary expressions
 
@@ -870,9 +944,11 @@ data CSEnv
             -- See Note [CSE for recursive bindings]
        }
 
-emptyCSEnv :: InScopeSet -> CSEnv
-emptyCSEnv in_scope
-    = CS { cs_map     = emptyCoreMap
+emptyCSEnv :: SimplCoreMode -> Bool -> InScopeSet -> CSEnv
+emptyCSEnv mode scoped_dicts in_scope
+    = CS { cs_mode    = mode
+         , cs_scoped_dicts = scoped_dicts
+         , cs_map     = emptyCoreMap
          , cs_rec_map = emptyCoreMap
          , cs_subst   = mkEmptySubst in_scope }
 
@@ -904,7 +980,21 @@ lookupSubst :: CSEnv -> Id -> OutExpr
 lookupSubst (CS { cs_subst = sub}) x = lookupIdSubst sub x
 
 extendCSSubst :: CSEnv -> Id  -> CoreExpr -> CSEnv
-extendCSSubst cse x rhs = cse { cs_subst = extendSubst (cs_subst cse) x rhs }
+extendCSSubst cse x rhs
+  | RetainedCore <- cs_mode cse
+  , isId x, not preserves_index
+  = cse  -- See Note [CSE for retained operands and case evidence]
+  | otherwise = cse { cs_subst = extendSubst (cs_subst cse) x rhs }
+  where
+    preserves_index
+      | cs_scoped_dicts cse, isNativeClassDictionaryId x
+      = maybe False isNativeClassDictionaryId (termVar_maybe rhs)
+      | not (isNativeOpaqueValueId x) = True
+      | isNativeIndexFunctionId x = isJust (nativeIndexFunctionVar_maybe rhs)
+      | cs_scoped_dicts cse = case retainedArgIndex rhs of
+          Just TermVarTy{} -> True
+          _ -> False
+      | otherwise = isJust (retainedArgIndex rhs)
 
 -- | Add clones to the substitution to deal with shadowing.  See
 -- Note [Shadowing in CSE] for more details.  You should call this whenever

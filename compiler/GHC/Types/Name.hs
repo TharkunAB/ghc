@@ -80,8 +80,8 @@ module GHC.Types.Name (
         NamedThing(..),
         getSrcLoc, getSrcSpan, getOccString, getOccFS,
 
-        pprInfixName, pprPrefixName, pprModulePrefix, pprNameUnqualified,
-        nameStableString,
+        pprInfixName, pprPrefixName, isSymOccForPpr, pprModulePrefix, pprNameUnqualified,
+        nameStableString, SourceProofRule, SourceProofArgs, SourceProofArg(..),
 
         -- Re-export the OccName stuff
         module GHC.Types.Name.Occurrence
@@ -719,6 +719,35 @@ stableNameCmp (Name { n_sort = s1, n_occ = occ1 })
 -}
 
 -- | The same comments as for `Name`'s `Ord` instance apply.
+-- | Rule head, first type constructor, mapper check and checked arguments.
+type SourceProofRule = (Name, Maybe Name, Bool, SourceProofArgs)
+
+-- | The checked shapes at corresponding value arguments.
+-- An empty list carries no refinement.
+type SourceProofArgs = [SourceProofArg Name]
+
+-- | A saturated ordinary constructor, or an operand without known shape.
+data SourceProofArg name
+  = SourceProofUnknown
+  | SourceProofCon name [SourceProofArg name]
+  deriving (Eq, Ord, Functor, Foldable, Traversable)
+
+instance NFData name => NFData (SourceProofArg name) where
+  rnf SourceProofUnknown = ()
+  rnf (SourceProofCon name fields) = rnf name `seq` rnf fields
+
+instance Outputable name => Outputable (SourceProofArg name) where
+  ppr SourceProofUnknown = text "_"
+  ppr (SourceProofCon name fields) = ppr (name, fields)
+
+instance Binary name => Binary (SourceProofArg name) where
+  put_ bh SourceProofUnknown = putByte bh 0
+  put_ bh (SourceProofCon name fields) = putByte bh 1 >> put_ bh name >> put_ bh fields
+  get bh = getByte bh >>= \case
+    0 -> pure SourceProofUnknown
+    1 -> SourceProofCon <$> get bh <*> get bh
+    _ -> panic "Binary.get(SourceProofArg)"
+
 instance Eq Name where
     a == b = case (a `compare` b) of { EQ -> True;  _ -> False }
     a /= b = case (a `compare` b) of { EQ -> False; _ -> True }
@@ -865,7 +894,7 @@ pprExternal :: Bool -> PprStyle -> Unique
             -> SDoc   -- wired-in, known-key or empty
             -> BuiltInSyntax
             -> SDoc
-pprExternal debug sty uniq mod user_qual occ pp_sort is_builtin
+pprExternal debug sty uniq mod user_qual raw_occ pp_sort is_builtin
   | debug         = pp_mod <> ppr_occ_name occ
                      <> braces (hsep [pp_sort,
                                       pprNameSpaceBrief (occNameSpace occ),
@@ -878,8 +907,27 @@ pprExternal debug sty uniq mod user_qual occ pp_sort is_builtin
                     _ -> braces (pprModuleName (moduleName mod) <> dot <> ppr_occ_name occ)
             else pprModulePrefix sty mod user_qual occ <> ppr_occ_name occ
   where
+    occ = occNameForPpr debug sty raw_occ
     pp_mod = ppUnlessOption sdocSuppressModulePrefixes
                (pprModule mod <> dot)
+
+{- Note [Printing source table names]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A diagnostic prints the family for a certified source function with the
+function's occurrence. Use that occurrence for qualification and for the
+choice between infix and prefix syntax. For example, print the family T:+
+as `n M.+ m` or `(M.+)`. Dumps and debug output keep the family occurrence.
+See Note [Names of finite source functions] in GHC.Rename.Env.
+-}
+
+occNameForPpr :: Bool -> PprStyle -> OccName -> OccName
+occNameForPpr debug sty occ
+  | PprUser{} <- sty, not debug, Just term <- sourceTableTermOcc occ = term
+  | otherwise = occ
+
+-- | Test whether the occurrence prints as an operator in this context.
+isSymOccForPpr :: OccName -> SDocContext -> Bool
+isSymOccForPpr occ ctx = isSymOcc (occNameForPpr (sdocPprDebug ctx) (sdocStyle ctx) occ)
 
 pprInternal :: Bool -> PprStyle -> Unique -> OccName -> SDoc
 pprInternal debug sty uniq occ
@@ -997,9 +1045,9 @@ getOccFS            = occNameFS            . getOccName
 pprInfixName :: (Outputable a, NamedThing a) => a -> SDoc
 -- See Outputable.pprPrefixVar, pprInfixVar;
 -- add parens or back-quotes as appropriate
-pprInfixName  n = pprInfixVar (isSymOcc (getOccName n)) (ppr n)
+pprInfixName n = sdocOption (isSymOccForPpr (getOccName n)) $ \sym -> pprInfixVar sym (ppr n)
 
 pprPrefixName :: (Outputable a, NamedThing a) => a -> SDoc
-pprPrefixName thing = pprPrefixVar (isSymOcc (nameOccName name)) (ppr thing)
+pprPrefixName thing = sdocOption (isSymOccForPpr (nameOccName name)) $ \sym -> pprPrefixVar sym (ppr thing)
  where
    name = getName thing

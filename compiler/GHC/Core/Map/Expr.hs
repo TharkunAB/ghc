@@ -150,6 +150,8 @@ data CoreMapX a
        , cm_tick  :: CoreMapG (TickishMap a)
        , cm_app   :: CoreMapG (CoreMapG a)
        , cm_lam   :: CoreMapG (BndrMap a)    -- Note [Binders]
+       , cm_pack  :: TypeMapG (TypeMapG (CoreMapG a))
+       , cm_unpack :: CoreMapG (CoreMapG a)
        , cm_letn  :: CoreMapG (CoreMapG (BndrMap a))
        , cm_letr  :: ListMap CoreMapG (CoreMapG (ListMap BndrMap a))
        , cm_case  :: CoreMapG (ListMap AltMap a)
@@ -168,6 +170,10 @@ eqDeBruijnExpr (D env1 e1) (D env2 e2) = go e1 e2 where
     go (Coercion {}) (Coercion {}) = True
     go (Cast e1 co1) (Cast e2 co2) = D env1 co1 == D env2 co2 && go e1 e2
     go (App f1 a1)   (App f2 a2)   = go f1 f2 && go a1 a2
+    go (Pack s1 w1 p1) (Pack s2 w2 p2)
+      = D env1 s1 == D env2 s2 && D env1 w1 == D env2 w2 && go p1 p2
+    go (Unpack w1 p1 e1 b1) (Unpack w2 p2 e2 b2)
+      = go e1 e2 && go (Lam w1 (Lam p1 b1)) (Lam w2 (Lam p2 b2))
     go (Tick n1 e1) (Tick n2 e2)
       =  eqDeBruijnTickish (D env1 n1) (D env2 n2)
       && go e1 e2
@@ -224,6 +230,16 @@ comparison for coercions (correctly) checks only their types, checking for
 alpha-equality of the coercions is redundant.
 -}
 
+{- Note [Erased packages as expression keys]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Key a Pack on its declared schema, supplied witness and payload. Two
+packages can have the same runtime representation and different types.
+Key an Unpack on its input and its body under both binders. The two
+lambdas in the body key use the existing alpha-equivalence rules for
+binder kinds, types and multiplicities. The outer Unpack has its own
+trie field, so its key cannot collide with a source lambda or application.
+-}
+
 {- Note [Alpha-equality for let-bindings]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 For /recursive/ let-bindings we need to check that the types of the binders
@@ -256,6 +272,7 @@ emptyE :: CoreMapX a
 emptyE = CM { cm_var = emptyTM, cm_lit = emptyTM
             , cm_co = emptyTM, cm_type = emptyTM
             , cm_cast = emptyTM, cm_app = emptyTM
+            , cm_pack = emptyTM, cm_unpack = emptyTM
             , cm_lam = emptyTM, cm_letn = emptyTM
             , cm_letr = emptyTM, cm_case = emptyTM
             , cm_ecase = emptyTM, cm_tick = emptyTM }
@@ -265,11 +282,13 @@ instance Functor CoreMapX where
     fmap f CM
       { cm_var = cvar, cm_lit = clit, cm_co = cco, cm_type = ctype, cm_cast = ccast
       , cm_app = capp, cm_lam = clam, cm_letn = cletn, cm_letr = cletr, cm_case = ccase
+      , cm_pack = cpack, cm_unpack = cunpack
       , cm_ecase = cecase, cm_tick = ctick } = CM
       { cm_var = fmap f cvar, cm_lit = fmap f clit, cm_co = fmap f cco, cm_type = fmap f ctype
       , cm_cast = fmap (fmap f) ccast, cm_app = fmap (fmap f) capp, cm_lam = fmap (fmap f) clam
       , cm_letn = fmap (fmap (fmap f)) cletn, cm_letr = fmap (fmap (fmap f)) cletr
       , cm_case = fmap (fmap f) ccase, cm_ecase = fmap (fmap f) cecase
+      , cm_pack = fmap (fmap (fmap f)) cpack, cm_unpack = fmap (fmap f) cunpack
       , cm_tick = fmap (fmap f) ctick }
 
 instance TrieMap CoreMapX where
@@ -288,12 +307,14 @@ ftE f (CM { cm_var = cvar, cm_lit = clit
           , cm_cast = ccast , cm_app = capp
           , cm_lam = clam, cm_letn = cletn
           , cm_letr = cletr, cm_case = ccase
+          , cm_pack = cpack, cm_unpack = cunpack
           , cm_ecase = cecase, cm_tick = ctick })
   = CM { cm_var = filterTM f cvar, cm_lit = filterTM f clit
        , cm_co = filterTM f cco, cm_type = filterTM f ctype
        , cm_cast = fmap (filterTM f) ccast, cm_app = fmap (filterTM f) capp
        , cm_lam = fmap (filterTM f) clam, cm_letn = fmap (fmap (filterTM f)) cletn
        , cm_letr = fmap (fmap (filterTM f)) cletr, cm_case = fmap (filterTM f) ccase
+       , cm_pack = fmap (fmap (filterTM f)) cpack, cm_unpack = fmap (filterTM f) cunpack
        , cm_ecase = fmap (filterTM f) cecase, cm_tick = fmap (filterTM f) ctick }
 
 mpE :: (a -> Maybe b) -> CoreMapX a -> CoreMapX b
@@ -302,12 +323,14 @@ mpE f (CM { cm_var = cvar, cm_lit = clit
           , cm_cast = ccast , cm_app = capp
           , cm_lam = clam, cm_letn = cletn
           , cm_letr = cletr, cm_case = ccase
+          , cm_pack = cpack, cm_unpack = cunpack
           , cm_ecase = cecase, cm_tick = ctick })
   = CM { cm_var = mapMaybeTM f cvar, cm_lit = mapMaybeTM f clit
        , cm_co = mapMaybeTM f cco, cm_type = mapMaybeTM f ctype
        , cm_cast = fmap (mapMaybeTM f) ccast, cm_app = fmap (mapMaybeTM f) capp
        , cm_lam = fmap (mapMaybeTM f) clam, cm_letn = fmap (fmap (mapMaybeTM f)) cletn
        , cm_letr = fmap (fmap (mapMaybeTM f)) cletr, cm_case = fmap (mapMaybeTM f) ccase
+       , cm_pack = fmap (fmap (mapMaybeTM f)) cpack, cm_unpack = fmap (mapMaybeTM f) cunpack
        , cm_ecase = fmap (mapMaybeTM f) cecase, cm_tick = fmap (mapMaybeTM f) ctick }
 
 --------------------------
@@ -336,6 +359,8 @@ fdE k m
   . foldTM (foldTM k) (cm_cast m)
   . foldTM (foldTM k) (cm_tick m)
   . foldTM (foldTM k) (cm_app m)
+  . foldTM (foldTM (foldTM k)) (cm_pack m)
+  . foldTM (foldTM k) (cm_unpack m)
   . foldTM (foldTM k) (cm_lam m)
   . foldTM (foldTM (foldTM k)) (cm_letn m)
   . foldTM (foldTM (foldTM k)) (cm_letr m)
@@ -353,6 +378,8 @@ lkE (D env expr) cm = go expr cm
     go (Cast e c)           = cm_cast >.> lkG (D env e) >=> lkG (D env c)
     go (Tick tickish e)     = cm_tick >.> lkG (D env e) >=> lkTickish tickish
     go (App e1 e2)          = cm_app  >.> lkG (D env e2) >=> lkG (D env e1)
+    go (Pack schema w p)    = cm_pack >.> lkG (D env schema) >=> lkG (D env w) >=> lkG (D env p)
+    go (Unpack w p e body)  = cm_unpack >.> lkG (D env e) >=> lkG (D env (Lam w (Lam p body)))
     go (Lam v e)            = cm_lam  >.> lkG (D (extendCME env v) e)
                               >=> lkBndr env v
     go (Let (NonRec b r) e) = cm_letn >.> lkG (D env r)
@@ -382,6 +409,10 @@ xtE (D env (Tick t e))           f m = m { cm_tick = cm_tick m |> xtG (D env e)
                                                  |>> xtTickish t f }
 xtE (D env (App e1 e2))          f m = m { cm_app = cm_app m |> xtG (D env e2)
                                                  |>> xtG (D env e1) f }
+xtE (D env (Pack schema w p)) f m = m { cm_pack = cm_pack m
+                                      |> xtG (D env schema) |>> xtG (D env w) |>> xtG (D env p) f }
+xtE (D env (Unpack w p e body)) f m = m { cm_unpack = cm_unpack m
+                                      |> xtG (D env e) |>> xtG (D env (Lam w (Lam p body))) f }
 xtE (D env (Lam v e))            f m = m { cm_lam = cm_lam m
                                                  |> xtG (D (extendCME env v) e)
                                                  |>> xtBndr env v f }
@@ -436,12 +467,13 @@ instance TrieMap AltMap where
 
 instance Eq (DeBruijn CoreAlt) where
   D env1 a1 == D env2 a2 = go a1 a2 where
-    go (Alt DEFAULT _ rhs1) (Alt DEFAULT _ rhs2)
-        = D env1 rhs1 == D env2 rhs2
+    go (Alt DEFAULT bs1 rhs1) (Alt DEFAULT bs2 rhs2)
+        = equalLength bs1 bs2 &&
+          D (extendCMEs env1 bs1) rhs1 == D (extendCMEs env2 bs2) rhs2
     go (Alt (LitAlt lit1) _ rhs1) (Alt (LitAlt lit2) _ rhs2)
         = lit1 == lit2 && D env1 rhs1 == D env2 rhs2
     go (Alt (DataAlt dc1) bs1 rhs1) (Alt (DataAlt dc2) bs2 rhs2)
-        = dc1 == dc2 &&
+        = dc1 == dc2 && equalLength bs1 bs2 &&
           D (extendCMEs env1 bs1) rhs1 == D (extendCMEs env2 bs2) rhs2
     go _ _ = False
 
@@ -452,14 +484,14 @@ ftA f (AM { am_deflt = adeflt, am_data = adata, am_lit = alit })
        , am_lit = fmap (filterTM f) alit }
 
 lkA :: CmEnv -> CoreAlt -> AltMap a -> Maybe a
-lkA env (Alt DEFAULT      _  rhs) = am_deflt >.> lkG (D env rhs)
+lkA env (Alt DEFAULT      bs rhs) = am_deflt >.> lkG (D (extendCMEs env bs) rhs)
 lkA env (Alt (LitAlt lit) _  rhs) = am_lit >.> lookupTM lit >=> lkG (D env rhs)
 lkA env (Alt (DataAlt dc) bs rhs) = am_data >.> lkDNamed dc
                                         >=> lkG (D (extendCMEs env bs) rhs)
 
 xtA :: CmEnv -> CoreAlt -> XT a -> AltMap a -> AltMap a
-xtA env (Alt DEFAULT _ rhs)      f m =
-    m { am_deflt = am_deflt m |> xtG (D env rhs) f }
+xtA env (Alt DEFAULT bs rhs)     f m =
+    m { am_deflt = am_deflt m |> xtG (D (extendCMEs env bs) rhs) f }
 xtA env (Alt (LitAlt l) _ rhs)   f m =
     m { am_lit   = am_lit m   |> alterTM l |>> xtG (D env rhs) f }
 xtA env (Alt (DataAlt d) bs rhs) f m =

@@ -37,6 +37,7 @@ Now `t` is no longer in a recursive function, and good things happen!
 
 import GHC.Prelude
 import GHC.Builtin.Uniques
+import GHC.Builtin.WiredIn.Ids ( voidArgId, voidPrimId )
 import GHC.Core
 import GHC.Core.Utils
 import GHC.Core.FVs
@@ -76,6 +77,12 @@ exitifyProgram binds = map goTopLvl binds
     go in_scope (Cast e' c) = Cast (go in_scope e') c
     go in_scope (Tick t e') = Tick t (go in_scope e')
     go in_scope (App e1 e2) = App (go in_scope e1) (go in_scope e2)
+
+    go in_scope (Pack schema witness payload)
+      = Pack schema witness (go in_scope payload)
+    go in_scope (Unpack witness payload package body)
+      = Unpack witness payload (go in_scope package) (go body_scope body)
+      where body_scope = in_scope `extendInScopeSetList` [witness, payload]
 
     go in_scope (Lam v e')
       = Lam v (go in_scope' e')
@@ -154,6 +161,11 @@ exitifyRec in_scope pairs
     -- into all expression where eligible exit join points might sit,
     -- i.e. into all tail-call positions:
 
+    -- Only the body inherits tail position. Abstract the witness before its payload.
+    go captured (_, AnnUnpack witness payload package body) = do
+        body' <- go (captured ++ [witness, payload]) body
+        return $ Unpack witness payload (deAnnotate package) body'
+
     -- Case right hand sides are in tail-call position
     go captured (_, AnnCase scrut bndr ty alts) = do
         alts' <- forM alts $ \(AnnAlt dc pats rhs) -> do
@@ -222,13 +234,21 @@ exitifyRec in_scope pairs
 
       -- We have something to float out!
       | otherwise
-      = do { -- Assemble the RHS of the exit join point
-             let rhs   = mkLams abs_vars e
+      = do { -- Assemble the RHS of the exit join point.
+             -- Append a void value argument if the abstracted binders end with a
+             -- TyVar or CoVar and the exit body is levity-polymorphic or unlifted.
+             let needs_void = any isId abs_vars
+                           && not (isId (last abs_vars))
+                           && not (tcIsLiftedTypeKind (typeKind (exprType e)))
+                 abs_vars1 | needs_void = abs_vars ++ [voidArgId]
+                           | otherwise  = abs_vars
+                 rhs   = mkLams abs_vars1 e
                  avoid = in_scope `extendInScopeSetList` captured
              -- Remember this binding under a suitable name
-           ; v <- addExit avoid (length abs_vars) rhs
+           ; v <- addExit avoid (length abs_vars1) rhs
              -- And jump to it from here
-           ; return $ mkVarApps (Var v) abs_vars }
+           ; let jump = mkVarApps (Var v) abs_vars
+           ; return $ if needs_void then App jump (Var voidPrimId) else jump }
 
       where
         -- Used to detect exit expressions that are already proper exit jumps

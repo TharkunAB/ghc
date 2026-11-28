@@ -72,6 +72,14 @@ module GHC.Types.Var (
         coreTyLamForAllTyFlag, isCoreTyLamForAllTyFlag,
         eqForAllVis, cmpForAllVis, cmpForAllTyFlagExactly,
 
+        -- * Retained function visibility
+        DepFunTyFlag(DepFunVisible, DepFunInvisibleSpec, DepFunInvisible, DepFunInferred),
+        isInvisibleDepFunFlag, isInferredDepFunFlag,
+        eqDepFunVis, cmpDepFunVis, normalizeDepFunVis,
+
+        -- * Erased existential visibility
+        ExistsTyFlag(..), pprExistsTy,
+
         -- * FunTyFlag
         FunTyFlag(..), isVisibleFunArg, isInvisibleFunArg, isFUNArg,
         mkFunTyFlag, visArg, invisArg,
@@ -572,6 +580,86 @@ cmpForAllTyFlagExactly Specified Specified = EQ
 cmpForAllTyFlagExactly Specified Required  = LT
 cmpForAllTyFlagExactly Required  Required  = EQ
 cmpForAllTyFlagExactly Required  _         = GT
+
+-- | Selects checking and elimination at the source existential binder.
+data ExistsTyFlag = ExplicitExists | ImplicitExists
+  deriving (Eq, Ord, Data)
+
+-- | Print the source binder and payload with the selected separator.
+pprExistsTy :: ExistsTyFlag -> SDoc -> SDoc -> SDoc
+pprExistsTy flag binder payload =
+  text "exists" <+> (case flag of
+    ExplicitExists -> binder <+> vbar
+    ImplicitExists -> binder <> dot) <+> payload
+
+-- | Source visibility and specificity of a retained runtime binder.
+-- Both visible and invisible flags represent value arguments in Core.
+data DepFunTyFlag
+  = DepFunVisible
+  | DepFunInvisibleSpec !Specificity
+  deriving (Eq, Ord, Data)
+
+instance Show DepFunTyFlag where
+  show DepFunVisible                       = "DepFunVisible"
+  show (DepFunInvisibleSpec SpecifiedSpec) = "DepFunInvisible"
+  show (DepFunInvisibleSpec InferredSpec)  = "DepFunInferred"
+
+pattern DepFunInvisible :: DepFunTyFlag
+pattern DepFunInvisible <- DepFunInvisibleSpec _
+  where
+    DepFunInvisible = DepFunInvisibleSpec SpecifiedSpec
+
+pattern DepFunInferred :: DepFunTyFlag
+pattern DepFunInferred = DepFunInvisibleSpec InferredSpec
+
+{-# COMPLETE DepFunVisible, DepFunInvisible #-}
+{-# COMPLETE DepFunVisible, DepFunInvisibleSpec #-}
+
+-- | Test whether a 'DepFunTyFlag' is invisible in source syntax.
+isInvisibleDepFunFlag :: DepFunTyFlag -> Bool
+isInvisibleDepFunFlag DepFunVisible           = False
+isInvisibleDepFunFlag (DepFunInvisibleSpec _) = True
+
+-- | Test whether an invisible 'DepFunTyFlag' has 'InferredSpec'.
+isInferredDepFunFlag :: DepFunTyFlag -> Bool
+isInferredDepFunFlag (DepFunInvisibleSpec InferredSpec) = True
+isInferredDepFunFlag _                                  = False
+
+-- | Compare 'DepFunTyFlag' visibility, equating 'SpecifiedSpec' and 'InferredSpec'.
+-- See Note [Comparing visibility] in GHC.Core.TyCo.Compare.
+eqDepFunVis :: DepFunTyFlag -> DepFunTyFlag -> Bool
+eqDepFunVis DepFunVisible           DepFunVisible           = True
+eqDepFunVis (DepFunInvisibleSpec _) (DepFunInvisibleSpec _) = True
+eqDepFunVis _                       _                       = False
+
+-- | Order 'DepFunTyFlag' visibility, equating 'SpecifiedSpec' and 'InferredSpec'.
+cmpDepFunVis :: DepFunTyFlag -> DepFunTyFlag -> Ordering
+cmpDepFunVis DepFunVisible           DepFunVisible           = EQ
+cmpDepFunVis DepFunVisible           (DepFunInvisibleSpec _) = LT
+cmpDepFunVis (DepFunInvisibleSpec _) DepFunVisible           = GT
+cmpDepFunVis (DepFunInvisibleSpec _) (DepFunInvisibleSpec _) = EQ
+
+-- | Canonicalize invisible specificity for 'TypeMap' keys.
+normalizeDepFunVis :: DepFunTyFlag -> DepFunTyFlag
+normalizeDepFunVis DepFunVisible           = DepFunVisible
+normalizeDepFunVis (DepFunInvisibleSpec _) = DepFunInvisibleSpec SpecifiedSpec
+
+instance Binary DepFunTyFlag where
+  put_ bh DepFunVisible                       = putByte bh 0
+  put_ bh (DepFunInvisibleSpec SpecifiedSpec) = putByte bh 1
+  put_ bh (DepFunInvisibleSpec InferredSpec)  = putByte bh 2
+
+  get bh = do
+    tag <- getByte bh
+    case tag of
+      0 -> return DepFunVisible
+      1 -> return (DepFunInvisibleSpec SpecifiedSpec)
+      2 -> return (DepFunInvisibleSpec InferredSpec)
+      _ -> fail ("DepFunTyFlag: invalid tag " ++ show tag)
+
+instance NFData DepFunTyFlag where
+  rnf DepFunVisible              = ()
+  rnf (DepFunInvisibleSpec spec) = rnf spec
 
 {- *********************************************************************
 *                                                                      *

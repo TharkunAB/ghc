@@ -67,6 +67,7 @@ import GHC.Core.Coercion hiding( substCo )
 import GHC.Core.DataCon ( dataConWorkId, isNullaryRepDataCon )
 import GHC.Core.Multiplicity
 import GHC.Core.Opt.ConstantFold
+import GHC.Builtin.WiredIn.Types ( unmatchableDataConTy )
 
 import GHC.Types.Name
 import GHC.Types.Id
@@ -562,7 +563,7 @@ contHoleScaling (Select { sc_bndr = id, sc_cont = k })
 contHoleScaling (StrictArg { sc_fun_ty = fun_ty, sc_cont = k })
   = w `mkMultMul` contHoleScaling k
   where
-    (w, _, _) = splitFunTy fun_ty
+    (_, w, _, _) = splitFunTy fun_ty
 contHoleScaling (ApplyToTy { sc_cont = k }) = contHoleScaling k
 contHoleScaling (ApplyToVal { sc_cont = k }) = contHoleScaling k
 contHoleScaling (TickIt _ k) = contHoleScaling k
@@ -768,10 +769,10 @@ mkArgInfo env fun rules_for_fun cont
     add_type_strictness fun_ty dmds
       | null dmds = []
 
-      | Just (_, fun_ty') <- splitForAllTyCoVar_maybe fun_ty
+      | Just (_ma, _, fun_ty') <- splitForAllTyCoVar_maybe fun_ty
       = add_type_strictness fun_ty' dmds     -- Look through foralls
 
-      | Just (_, _, arg_ty, fun_ty') <- splitFunTy_maybe fun_ty        -- Add strict-type info
+      | Just (_, _, _, arg_ty, fun_ty') <- splitFunTy_maybe fun_ty        -- Add strict-type info
       , dmd : rest_dmds <- dmds
       , let dmd'
              | definitelyUnliftedType arg_ty
@@ -1158,6 +1159,10 @@ interestingArg env se e
        | isTyVar v             = go env n e
        | n>0                   = NonTrivArg     -- (\x.b) e   is NonTriv
        | otherwise             = ValueArg
+    -- A Pack has the same evaluation cost as its payload. Unpack binds
+    -- the payload lazily, so its scrutinee supplies no value information.
+    go env _ (Pack _ _ payload) = go env 0 payload
+    go _ _ Unpack{}            = NonTrivArg
     go _ _ (Case {})           = NonTrivArg
     go env n (Let b e)         = case go env' n e of
                                    ValueArg -> ValueArg
@@ -2061,10 +2066,11 @@ rebuildLam env bndrs@(bndr:_) body cont
       | -- Note [Casts and lambdas]
         seCastSwizzle env
       , not (any bad bndrs)
-      = mkCast (mk_lams bndrs body) (mkPiCos Representational bndrs co)
+      = mkCast (mk_lams bndrs body) (mkPiCos Representational [(unmatchableDataConTy,b) | b <- bndrs] co)
       where
         co_vars  = tyCoVarsOfCo co
-        bad bndr = isCoVar bndr && bndr `elemVarSet` co_vars
+        bad bndr = bndr `elemVarSet` co_vars
+                   && (isCoVar bndr || (isId bndr && not (isNativeOpaqueValueId bndr)))
 
     mk_lams bndrs body
       = mkLams bndrs body
@@ -2490,7 +2496,7 @@ abstractFloats uf_opts top_lvl main_tvs floats body
     mk_poly1 tvs_here var
       = do { uniq <- getUniqueM
            ; let  poly_name = setNameUnique (idName var) uniq      -- Keep same name
-                  poly_ty   = mkInfForAllTys tvs_here (idType var) -- But new type of course
+                  poly_ty   = mkInfForAllTys [(unmatchableDataConTy,tv) | tv <- tvs_here] (idType var) -- But new type of course
                   poly_id   = transferPolyIdInfo var tvs_here $ -- Note [transferPolyIdInfo] in GHC.Types.Id
                               mkLocalId poly_name (idMult var) poly_ty
            ; return (poly_id, mkTyApps (Var poly_id) (mkTyVarTys tvs_here)) }

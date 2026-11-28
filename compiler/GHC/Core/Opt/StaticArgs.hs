@@ -55,6 +55,7 @@ module GHC.Core.Opt.StaticArgs ( doStaticArgs ) where
 import GHC.Prelude
 
 import GHC.Core
+import GHC.Core.Dependent ( hasNativeDependentExpr )
 import GHC.Core.Utils
 import GHC.Core.Type
 import GHC.Core.Coercion
@@ -249,6 +250,15 @@ satExpr (Cast expr coercion) interesting_ids = do
     (expr', sat_info_expr, expr_app) <- satExpr expr interesting_ids
     return (Cast expr' coercion, sat_info_expr, expr_app)
 
+satExpr (Pack schema witness payload) interesting_ids = do
+    (payload', sat_info, app_info) <- satExpr payload interesting_ids
+    return (Pack schema witness payload', finalizeApp app_info sat_info, Nothing)
+
+satExpr (Unpack witness payload package body) interesting_ids = do
+    (package', sat_info_pkg) <- satTopLevelExpr package interesting_ids
+    (body', sat_info_body, body_app) <- satExpr body interesting_ids
+    return (Unpack witness payload package' body', mergeIdSATInfo sat_info_pkg sat_info_body, body_app)
+
 {-
 ************************************************************************
 
@@ -371,6 +381,7 @@ is not well typed.
 saTransformMaybe :: Id -> Maybe SATInfo -> [Id] -> CoreExpr -> SatM CoreBind
 saTransformMaybe binder maybe_arg_staticness rhs_binders rhs_body
   | Just arg_staticness <- maybe_arg_staticness
+  , not (hasNativeDependentExpr (Type (idType binder)))
   , should_transform arg_staticness
   = saTransform binder arg_staticness rhs_binders rhs_body
   | otherwise

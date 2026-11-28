@@ -232,39 +232,35 @@ tidyTypes env tys = strictMap (tidyType env) tys
 tidyType :: TidyEnv -> Type -> Type
 tidyType _   t@(LitTy {})           = t -- Preserve sharing
 tidyType env (TyVarTy tv)           = TyVarTy $! tidyTyCoVarOcc env tv
+tidyType env (TermVarTy var)        = TermVarTy $! tidyTyCoVarOcc env var
+tidyType env (TermAppTy fun arg)    = (TermAppTy $! tidyTyCoVarOcc env fun) $! tidyType env arg
+tidyType env (ClassAppTy f inst dict operand kind)
+  = ClassAppTy f (tidyType env inst) (tidyType env dict) (tidyType env operand) (tidyType env kind)
+tidyType env (DepDictTy var res) = (DepDictTy $! var') $! tidyType body_env res
+  where
+    (body_env, var') = tidyVarBndr env var
+tidyType env (ExistsTy flag var body) = (ExistsTy flag $! var') $! tidyType body_env body
+  where
+    (body_env, var') = tidyVarBndr env var
+tidyType env (DepFunTy vis var res) = (DepFunTy vis $! var') $! tidyType body_env res
+  where
+    (body_env, var') = tidyVarBndr env var
 tidyType _   t@(TyConApp _ [])      = t -- Preserve sharing if possible
 tidyType env (TyConApp tycon tys)   = TyConApp tycon $! tidyTypes env tys
 tidyType env (AppTy fun arg)        = (AppTy $! (tidyType env fun)) $! (tidyType env arg)
 tidyType env (CastTy ty co)         = (CastTy $! tidyType env ty) $! (tidyCo env co)
 tidyType env (CoercionTy co)        = CoercionTy $! (tidyCo env co)
-tidyType env ty@(FunTy _ w arg res) = let { !w'   = tidyType env w
-                                          ; !arg' = tidyType env arg
-                                          ; !res' = tidyType env res }
-                                      in ty { ft_mult = w', ft_arg = arg', ft_res = res' }
-tidyType env (ty@(ForAllTy{}))      = tidyForAllType env ty
-
-
-tidyForAllType :: TidyEnv -> Type -> Type
-tidyForAllType env ty
-   = (mkForAllTys' $! (zip tcvs' vis)) $! tidyType body_env body_ty
-  where
-    (tcvs, vis, body_ty) = splitForAllTyCoVars' ty
-    (body_env, tcvs') = tidyVarBndrs env tcvs
-
--- The following two functions differ from mkForAllTys and splitForAllTyCoVars in that
--- they expect/preserve the ForAllTyFlag argument. These belong to "GHC.Core.Type", but
--- how should they be named?
-mkForAllTys' :: [(TyCoVar, ForAllTyFlag)] -> Type -> Type
-mkForAllTys' tvvs ty = foldr strictMkForAllTy ty tvvs
-  where
-    strictMkForAllTy (tv,vis) ty = (ForAllTy $! ((Bndr $! tv) $! vis)) $! ty
-
-splitForAllTyCoVars' :: Type -> ([TyCoVar], [ForAllTyFlag], Type)
-splitForAllTyCoVars' ty = go ty [] []
-  where
-    go (ForAllTy (Bndr tv vis) ty) tvs viss = go ty (tv:tvs) (vis:viss)
-    go ty                          tvs viss = (reverse tvs, reverse viss, ty)
-
+tidyType env ty@(FunTy _ ma w arg res)
+  = let { !ma'  = tidyType env ma
+        ; !w'   = tidyType env w
+        ; !arg' = tidyType env arg
+        ; !res' = tidyType env res }
+    in ty { ft_ma = ma', ft_mult = w', ft_arg = arg', ft_res = res' }
+tidyType env (ForAllTy ma (Bndr tv vis) body)
+  = let !ma' = tidyType env ma
+        (body_env, tv') = tidyVarBndr env tv
+    in mkTyCoForAllTy ma' tv' vis (tidyType body_env body)
+    -- See Note [Forall matchability metadata] in GHC.Core.TyCo.Rep.
 
 ---------------
 tidyAvoiding :: [OccName]
@@ -335,12 +331,17 @@ tidyCo env co
     go (GRefl r ty mco)      = (GRefl r $! tidyType env ty) $! go_mco mco
     go (TyConAppCo r tc cos) = TyConAppCo r tc $! strictMap go cos
     go (AppCo co1 co2)       = (AppCo $! go co1) $! go co2
-    go (ForAllCo tv visL visR h co)
-      = ((((ForAllCo $! tvp) $! visL) $! visR) $! (go_mco h)) $! (tidyCo envp co)
+    go (TermAppCo fun co)    = (TermAppCo $! tidyTyCoVarOcc env fun) $! go co
+    go (DepFunCo visL visR var domain co)
+      = ((DepFunCo visL visR $! var') $! go_mco domain) $! tidyCo body_env co
+      where (body_env, var') = tidyVarBndr env var
+    go (ForAllCo tv visL visR ma h co)
+      = (((((ForAllCo $! tvp) $! visL) $! visR) $! go ma) $! go_mco h) $! tidyCo envp co
       where (envp, tvp) = tidyVarBndr env tv
             -- the case above duplicates a bit of work in tidying h and the kind
             -- of tv. But the alternative is to use coercionKind, which seems worse.
-    go (FunCo r afl afr w co1 co2) = ((FunCo r afl afr $! go w) $! go co1) $! go co2
+    go (FunCo r afl afr ma w co1 co2)
+      = (((FunCo r afl afr $! go ma) $! go w) $! go co1) $! go co2
     go (CoVarCo cv)          = CoVarCo $! go_cv cv
     go (HoleCo h)            = HoleCo $! go_hole h
     go (AxiomCo ax cos)      = AxiomCo ax $ strictMap go cos
