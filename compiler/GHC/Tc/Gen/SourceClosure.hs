@@ -2198,7 +2198,9 @@ runClosureStage is_early public candidates orig_env mb_fin_env
             Nothing -> (, orig_s) <$> lookupOwner old
             Just fin_env -> do
               act <- lookupClosureRoot old
-              fs <- lookupVarEnv fin_env act >>= scopeFamilyInputs fin_env act
+              raw_fin_rhs <- lookupVarEnv fin_env act
+              let (_, eff_fin_rhs) = resolveForwardCseAlias fin_env act raw_fin_rhs
+              fs <- scopeFamilyInputs fin_env act eff_fin_rhs
               (act, fs) <$ guard (sameScopeShape orig_s fs)
           hs <- extDeps isExternalName old actual
           (actual, (orig_s, fin_s), hs) <$ guard (not (null hs) && safe actual hs)
@@ -2595,7 +2597,9 @@ validateEarlyIndexedLookups plugins_free rules desugared_binds mb_simplified mb_
           early_s <- MaybeT (pure (scopeFamilyInputs (sb_env desug) d_actual d_rhs))
           let exp_arity = if isJust (ss_sort early_s) then 2 * ss_arity early_s + 3 else ss_arity early_s + 2
               checkClosure sb = do
-                (actual, rhs) <- lookupStage owner True helpers sb
+                (actual, raw_rhs) <- lookupStage owner True helpers sb
+                let (mb_alias, rhs) = resolveForwardCseAlias (sb_env sb) actual raw_rhs
+                for_ mb_alias (guard . noUserIdRules)
                 shape <- MaybeT (pure (scopeFamilyInputs (sb_env sb) actual rhs))
                 guard (sameScopeShape early_s shape)
           guard ((not is_subst_map || isNothing (ss_sort early_s)) && tyConArity table == exp_arity)
