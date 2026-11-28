@@ -73,6 +73,7 @@ import GHC.Utils.Panic
 
 import GHC.Core.Multiplicity
 import GHC.Core
+import GHC.Core.Make ( mkImpossibleExpr )
 import GHC.Core.Predicate
 
 import GHC.Types.Name
@@ -460,7 +461,8 @@ scoped flag in 'tcg_th_state'. When that flag is active:
    calling 'writeMetaTyVarRef'. Every occurrence within the 'ZonkEnv' receives
    the same 'Type', and live solver 'MetaTv' references remain 'Flexi'.
 2. 'commitFlexi' suppresses premature 'ZonkerCannotDefaultConcrete' diagnostics.
-3. 'zonkExpr' clones 'HoleExprRef' cells instead of mutating them in place.
+3. 'zonkExpr' replaces each 'HoleExprRef' with a fresh placeholder reference
+   without forcing the live unfilled cell.
 -}
 
 newtype ReadOnlyFinalZonk = ReadOnlyFinalZonk Bool
@@ -994,14 +996,12 @@ zonkExpr (HsHole (h, her))
   where
     zonk_her :: HoleExprRef -> ZonkTcM HoleExprRef
     zonk_her (HER ref ty u)
-      = do ro <- lift isReadOnlyFinalZonk
+      = do ro  <- lift isReadOnlyFinalZonk
+           ty' <- zonkTcTypeToTypeX ty
            -- See Note [Read-only final zonking during constraint solving].
            ref' <- if ro
-                   then do { ev <- readTcRef ref
-                           ; ev' <- zonkEvTerm ev
-                           ; lift $ newTcRef ev' }
+                   then lift $ newTcRef (EvExpr (mkImpossibleExpr ty' "unfilled expression hole"))
                    else do { updTcRefM ref zonkEvTerm; return ref }
-           ty'  <- zonkTcTypeToTypeX ty
            return (HER ref' ty' u)
 
 zonkExpr (HsIPVar x _) = dataConCantHappen x

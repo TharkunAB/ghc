@@ -3690,6 +3690,8 @@ localOpenDefinitions demands evidence binds = do
         definition_names = unionNameSets (map fst relevant_binds)
     when (any hasPendingTypedSplice relevant) $
       rejectLocalOpen demands "This earlier definition contains a pending typed splice."
+    when (any hasExprHole relevant) $
+      rejectLocalOpen demands "This earlier definition contains an expression hole."
     (_, zonked_ev_binds, zonked, _, _, _, _) <- withReadOnlyFinalZonk $ zonkTopDecls evidence relevant [] [] [] []
     let collect_lets (Core.Let b e) = let (bs, body) = collect_lets e in (b : bs, body)
         collect_lets e              = ([], e)
@@ -3735,6 +3737,12 @@ localOpenDefinitions demands evidence binds = do
       Just HsTypedSplice{} -> True
       _ -> or (gmapQ hasPendingTypedSplice node)
 
+    hasExprHole :: Data a => a -> Bool
+    hasExprHole node = case cast node :: Maybe (HsExpr GhcTc) of
+      Just HsHole{}        -> True
+      Just HsTypedSplice{} -> False
+      _                    -> or (gmapQ hasExprHole node)
+
 -- | Close the requested names over the eligible bindings in the graph.
 closeLocalNames :: Monad m => (Name -> m NameSet) -> NameSet -> [Name] -> m NameSet
 closeLocalNames dependencies = foldM visit
@@ -3751,7 +3759,7 @@ closeLocalNames dependencies = foldM visit
 opportunisticOpenDefinitions :: Bag EvBind -> LHsBinds GhcTc
                              -> TcM (NameEnv (Id, CoreExpr), NameEnv Id)
 opportunisticOpenDefinitions evidence binds = do
-    let safe_binds = [ bind | bind <- binds, not (hasPendingTypedSplice bind) ]
+    let safe_binds = [ bind | bind <- binds, not (hasPendingTypedSplice bind), not (hasExprHole bind) ]
     if null safe_binds
       then pure (emptyNameEnv, emptyNameEnv)
       else do
@@ -3782,6 +3790,12 @@ opportunisticOpenDefinitions evidence binds = do
     hasPendingTypedSplice node = case cast node :: Maybe (HsExpr GhcTc) of
       Just HsTypedSplice{} -> True
       _ -> or (gmapQ hasPendingTypedSplice node)
+
+    hasExprHole :: Data a => a -> Bool
+    hasExprHole node = case cast node :: Maybe (HsExpr GhcTc) of
+      Just HsHole{}        -> True
+      Just HsTypedSplice{} -> False
+      _                    -> or (gmapQ hasExprHole node)
 
 -- | Collect resolved term and evidence references from one checked binding.
 localOpenReferences :: Data a => a -> [Name]
