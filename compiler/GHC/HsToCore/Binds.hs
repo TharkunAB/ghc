@@ -564,6 +564,7 @@ An ordinary binding without an unfolding request needs no native scan here.
 -}
 
 -- | Convert the arity of the written patterns to Core call saturation.
+-- See Note [Saturation arity under equalities and type families].
 findSatArity :: VisArity -> Type -> Arity
 findSatArity vis_arity ty = go vis_arity ty
   where
@@ -574,8 +575,27 @@ findSatArity vis_arity ty = go vis_arity ty
       = step ar True True res
       | Just (_, bndr, res) <- splitPiTy_maybe next
       = step ar (isInvisiblePiTyBinder bndr) (isRuntimePiTyBinder bndr) res
-      | ar == 0 = 0
-      | otherwise = pprPanic "findSatArity" (ppr vis_arity $$ ppr ty)
+      | otherwise = ar
+
+{- Note [Saturation arity under equalities and type families]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A binding with an INLINE pragma can have more written value patterns than
+syntactic Pi binders in its quantified type when a trailing function arrow is
+mediated by a Given equality or type family:
+
+  class C a b r | a b -> r where
+    op :: a -> b -> r
+
+  instance (r ~ (c -> d)) => C (d -> d) (c -> d) r where
+    (op f g) c = f (g c)
+    {-# INLINE op #-}
+
+Here `vis_arity` is 3, while the method type `(r ~ (c -> d)) => (d -> d) -> (c -> d) -> r`
+exposes one invisible dictionary binder and two visible function arrows before
+reaching the type variable `r`. Once `go` reaches a non-Pi result `next`, any
+remaining `ar` written patterns correspond to runtime value arguments supplied
+after casting `next` to a function type, so `go` returns `ar`.
+-}
 
     step ar invisible runtime res
       | invisible = count_arg + go ar res
